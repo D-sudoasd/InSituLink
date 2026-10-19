@@ -78,10 +78,23 @@ Requires Python 3 with **tkinter** (standard on most Windows / macOS Python inst
 - Output quality **tracks the reference curve**; garbage in → garbage out
 - Always verify **fraction vs percent** strain before publishing figures or tables
 
+## Frame time alignment / 帧–应力–应变时间对齐
+
+The Tk tool completes a missing stress or strain **on a reference curve**. The separate alignment entry places each frame on the **tensile record in time**. Those are different operations. Time alignment is not a wall-clock lock and not a sub-second lock.
+
+帧时间对齐不是参考曲线插值，也不是墙钟锁定。每帧的查询时刻是曝光中点加一个 Δt。Δt 来自晶格应变起跳和力离开预载；分不清就保持 0，并在 decision 里写明原因。帧间隔是有限 `start_time` 的差，不用名义 `frame_time`、读出时间、`帧号 × 曝光`、填充帧数或 NeXus GUI 与探测器的时差。
+
+```powershell
+python -m strainlink align --demo heps_id07_eiger
+python -m strainlink align --demo extracted_frame_clock
+```
+
+Profiles: `heps_id07_eiger` (finite Eiger starts + count time, no image read) and `extracted_frame_clock` (a frame table from another station, no HEPS HDF5). Details and the flags an agent must read: [docs/TIME_ALIGNMENT.md](docs/TIME_ALIGNMENT.md).
+
 ## Tests
 
 ```powershell
-python -m unittest tests/test_stress_strain_mapper.py -v
+python -m unittest tests/test_stress_strain_mapper.py tests/test_time_align.py -v
 ```
 
 ## License
