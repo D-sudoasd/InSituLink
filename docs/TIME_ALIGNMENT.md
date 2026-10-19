@@ -35,7 +35,7 @@ On HEPS ID07 the count time is 1.0 s. Realized start-to-start intervals are abou
 | `rising_before_record` | Applying Δt would put already-rising strain before the tensile record |
 | `subframe_disagreement` | The sub-frame threshold crossing disagrees by more than one measured frame interval |
 | `xcorr_disagreement` | A sharp derivative correlation disagrees by more than one frame. A weak correlation does not move Δt |
-| `load_rise_missing` | Force never leaves preload, so no lag is invented |
+| `load_rise_missing` | Force never holds a sustained rise above preload. A prefix spike shorter than the minimum run is not a load-rise, so no lag is invented |
 
 Rejected candidate lags are stored as `rejected_dt_s`. The published `dt_s` is 0.
 

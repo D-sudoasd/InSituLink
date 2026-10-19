@@ -71,8 +71,9 @@ def detect_load_rise(
 ) -> tuple[int, str]:
     """Where tensile force leaves preload.
 
-    Returns ``(index, status)``. Status is ``found``, ``at_start``, or
-    ``missing``. A missing rise is not reported as index 0 with a real lag.
+    Returns ``(index, status)``. Status is ``found`` or ``at_start`` only
+    after ``min_run`` consecutive samples clear the floor. A lone prefix
+    spike, or any run shorter than that, is ``missing`` and must not become Δt.
     """
     series = _as_float_array(force)
     if series.size == 0:
@@ -95,8 +96,6 @@ def detect_load_rise(
         else:
             run = 0
             first = None
-    if scored[0] >= floor:
-        return 0, "at_start"
     return 0, "missing"
 
 

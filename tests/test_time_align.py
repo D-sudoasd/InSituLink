@@ -188,6 +188,35 @@ class TimeAlignFixtureTest(unittest.TestCase):
         self.assertEqual(decision["unresolved_reason"], "load_rise_missing")
         self.assertEqual(decision["dt_s"], 0.0)
 
+    def test_unsustained_prefix_spike_is_not_a_load_rise(self):
+        n = 16
+        start = (np.arange(n, dtype=float) * 5.0).tolist()
+        eps = np.zeros(n)
+        eps[8:] = 2e-4
+        t = np.arange(0.0, 80.0, 0.5)
+        force = np.full(t.shape, 8.0)
+        force[0] = 80.0
+        frames = {
+            "start_time_s": start,
+            "count_time_s": 1.0,
+            "eps_hkl": eps.tolist(),
+        }
+        tensile = {
+            "t_s": t.tolist(),
+            "force": force.tolist(),
+            "stress": (2.0 * t).tolist(),
+            "strain": (0.01 * t).tolist(),
+        }
+        result = align_scan(frames, tensile, "heps_id07_eiger")
+        decision = result["decision"]
+        self.assertEqual(decision["load_rise_status"], "missing")
+        self.assertTrue(decision["onset_unresolved"])
+        self.assertEqual(decision["unresolved_reason"], "load_rise_missing")
+        self.assertEqual(decision["dt_s"], 0.0)
+        frame = result["table"][8]
+        self.assertAlmostEqual(frame["t_mech_s"], 8 * 5.0 + 0.5)
+        self.assertAlmostEqual(frame["stress"], 2.0 * frame["t_mech_s"])
+
     def test_extracted_clock_profile_uses_the_same_core(self):
         frames, tensile = demo_records("extracted_frame_clock")
         result = align_scan(frames, tensile, "extracted_frame_clock")
