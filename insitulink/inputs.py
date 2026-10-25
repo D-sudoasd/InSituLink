@@ -27,7 +27,7 @@ _MAX_METADATA_ROWS = 10_000_000
 
 def _path(value, base_dir):
     path = Path(value).expanduser()
-    return (path if path.is_absolute() else Path(base_dir) / path).resolve()
+    return (path if path.is_absolute() else Path(base_dir) / path).resolve(strict=False)
 
 
 def _text(value):
@@ -36,6 +36,11 @@ def _text(value):
 
 def _missing(value):
     return value is None or (isinstance(value, str) and not value.strip())
+
+
+def canonical_source_file(value, base_dir) -> str | None:
+    """Resolve a declared raw source using the frame reader's missing semantics."""
+    return None if _missing(value) else str(_path(value, base_dir))
 
 
 def _number(value, label, *, missing=False):
@@ -144,7 +149,15 @@ def _records(config, base_dir):
             suffix = path.suffix.lower()
             if suffix == ".csv":
                 with path.open("r", encoding="utf-8-sig", newline="") as stream:
-                    rows = list(csv.DictReader(stream))
+                    header = next(csv.reader(stream), [])
+                    empty = [i for i, key in enumerate(header) if _missing(key)]
+                    duplicates = list(dict.fromkeys(key for i, key in enumerate(header) if key in header[:i]))
+                    if not header or empty or duplicates:
+                        raise InputError("CSV requires unique, nonempty column names; "
+                                         f"duplicate columns: {duplicates}; empty column positions: {empty}",
+                                         code="invalid_table_header", duplicate_columns=duplicates,
+                                         empty_column_positions=empty, source_file=str(path))
+                    rows = list(csv.DictReader(stream, fieldnames=header))
             elif suffix == ".json":
                 with path.open("r", encoding="utf-8-sig") as stream:
                     rows = json.load(stream)
@@ -211,6 +224,11 @@ def _frame_rows(records, config, base_dir, origin, *, starts=None, exposures=Non
     reconstruction_origin = (_iso(settings["start"], settings)
                              if settings.get("start") is not None else 0.0)
     for i, (row, start, exposure) in enumerate(zip(records, starts, exposures)):
+        source = canonical_source_file(row.get(columns["source_file"]), base_dir)
+        if source is not None and _missing(row.get(columns["frame_index"])):
+            raise InputError(f"row {i} referencing a raw source requires an explicit file-local frame_index",
+                             code="missing_frame_index", row=i, source_file=source,
+                             frame_index_column=columns["frame_index"])
         index = _number(row.get(columns["frame_index"], i), f"row {i} frame_index")
         if index < 0 or index != int(index):
             raise InputError(f"row {i} frame_index must be a nonnegative integer")
@@ -224,7 +242,6 @@ def _frame_rows(records, config, base_dir, origin, *, starts=None, exposures=Non
             exposure = period[0]
         if exposure is not None and (not math.isfinite(exposure) or exposure < 0):
             raise InputError(f"row {i} exposure must be finite and nonnegative")
-        source = row.get(columns["source_file"])
         dataset = row.get(columns["dataset"])
         item = dict(row)
         # CSV numerical features remain usable by the feature-alignment stage.
@@ -234,7 +251,7 @@ def _frame_rows(records, config, base_dir, origin, *, starts=None, exposures=Non
                     item[name] = float(value)
                 except ValueError:
                     pass
-        item.update(source_file=None if _missing(source) else str(_path(source, base_dir)),
+        item.update(source_file=source,
                     dataset=None if _missing(dataset) else str(dataset), frame_index=index,
                     frame_number=index + 1, original_id=row.get(columns["id"], row.get("original_id")),
                     t_start_s=start, exposure_s=exposure,
@@ -254,6 +271,7 @@ def _frame_rows(records, config, base_dir, origin, *, starts=None, exposures=Non
                     "missing_time_indices": [row["frame_index"] for row in result if row["time_missing"]],
                     "nonmonotonic_rows": decreases, "duplicate_time_rows": duplicates,
                     "reconstructed_rows": reconstructed, "reconstructed": bool(reconstructed),
+                    "reconstructed_frame_indices": [result[i]["frame_index"] for i in reconstructed],
                     "time": dict(settings)}
 
 
@@ -307,7 +325,9 @@ def _hdf5_frames(config, base_dir):
                                  **count_details)
             dropped = []
             frame_config = config
-            if stamp is not None and stamp.ndim == 0 and finite and requested_count is not None and requested_count != 1:
+            count_source = "frame_count" if "frame_count" in config else "finite_timestamps"
+            if (stamp is not None and stamp.ndim == 0 and finite and requested_count != 1
+                    and (period is not None or "frame_count" not in config)):
                 if period is None:
                     raise InputError("A scalar acquisition start requires confirmed constant-period reconstruction for multiple frames",
                                      code="missing_frame_times")
@@ -319,9 +339,13 @@ def _hdf5_frames(config, base_dir):
                 origin = _iso(settings["start"], settings) if settings.get("start") is not None else 0.0
                 frame_config["constant_period"]["start_s"] = starts[0] - origin
                 raw_starts = raw_starts + [None] * (count - 1)
+                count_source = "frame_count" if "frame_count" in config else "data_dataset"
             elif finite:
-                count = finite[-1] + 1
+                count = requested_count if "frame_count" in config else finite[-1] + 1
+                if count > _MAX_METADATA_ROWS:
+                    raise InputError("Frame metadata requires a bounded positive frame_count")
                 dropped = list(range(count, len(starts)))
+                raw_starts = raw_starts[:count] + [None] * max(0, count - len(raw_starts))
             elif period is not None:
                 count = requested_count
                 count = _number(count, "frame_count")
@@ -329,10 +353,14 @@ def _hdf5_frames(config, base_dir):
                     raise InputError("Confirmed reconstruction requires a bounded positive frame_count")
                 count = int(count)
                 raw_starts = [None] * count
+                count_source = "frame_count" if "frame_count" in config else "data_dataset"
             else:
                 raise InputError("No finite frame timestamps in HDF5; confirmed reconstruction is required", code="missing_frame_times")
             exposure = handle.get(exposure_name)
             exposure_count = None
+            exposure_unit = config.get("exposure_unit", "s")
+            exposure_unit_source = "config.exposure_unit" if "exposure_unit" in config else "default_seconds"
+            exposure_scale = 1.0
             if exposure is None:
                 exposures = [None] * count
             else:
@@ -340,8 +368,11 @@ def _hdf5_frames(config, base_dir):
                     raise InputError("Exposure dataset must be a bounded scalar or vector")
                 values = np.asarray(exposure[()]).reshape(-1).tolist()
                 exposure_count = len(values)
-                units = exposure.attrs.get("units", config.get("exposure_unit", "s"))
-                factor = _factor(units) * _number(exposure.attrs.get("scaling_factor", 1), "exposure scaling_factor")
+                if "exposure_unit" not in config and "units" in exposure.attrs:
+                    exposure_unit = exposure.attrs["units"]
+                    exposure_unit_source = "exposure_dataset.units"
+                exposure_scale = _number(exposure.attrs.get("scaling_factor", 1), "exposure scaling_factor")
+                factor = _factor(exposure_unit) * exposure_scale
                 values = [None if _missing(value) else _number(value, "exposure", missing=True) for value in values]
                 exposures = [None if value is None else value * factor for value in values]
                 exposures = exposures * count if len(exposures) == 1 else (exposures + [None] * max(0, count - len(exposures)))[:count]
@@ -355,7 +386,16 @@ def _hdf5_frames(config, base_dir):
                     mismatches[name] = {"declared_count": value, "retained_count": count}
             metadata.update(n_input_rows=len(starts) if starts else count, timestamp_count=len(starts),
                             data_dataset=data_name, data_frame_count=data_count,
-                            dropped_padded_indices=dropped, count_mismatches=mismatches)
+                            dropped_padded_indices=dropped, count_mismatches=mismatches,
+                            frame_count_source=count_source,
+                            observed_timestamp_frame_count=finite[-1] + 1 if finite else 0,
+                            frame_count_unresolved=count < data_count and "frame_count" not in config,
+                            exposure_unit=_text(exposure_unit), exposure_unit_source=exposure_unit_source,
+                            exposure_scaling_factor=exposure_scale)
+            if metadata["frame_count_unresolved"]:
+                metadata["frame_count_unresolved_reason"] = (
+                    "Physical detector frame count exceeds the last finite timestamp; "
+                    "supply frame_count and clock evidence for missing timestamps")
             return rows, metadata
     except (OSError, KeyError, ValueError) as exc:
         if isinstance(exc, InputError):

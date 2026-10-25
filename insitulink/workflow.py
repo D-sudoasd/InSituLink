@@ -66,12 +66,16 @@ def _inline_features(frames):
 
 def _preview_dependencies(config, frames, base, files):
     paths = []
+    storage = {"paths": [], "complete": True, "issues": [], "datasets": []}
     if config.get("type") == "spectra":
         paths.extend(_path(item["path"], base) for item in config.get("files", []))
     else:
+        from .hdf5_sources import discover_dependencies
+
         paths.extend(_path(config[name], base) for name in ("geometry", "mask") if config.get(name))
-        paths.extend(Path(row["source_file"]) for row in frames if row.get("source_file"))
-    return [files.file(path) for path in dict.fromkeys(paths)]
+        storage = discover_dependencies(frames)
+        paths.extend(Path(path) for path in storage["paths"])
+    return {"files": [files.file(path) for path in dict.fromkeys(paths)], "storage": storage}
 
 
 def _frames(config, base, stages, files):
@@ -162,7 +166,7 @@ def _table(frames, sources, decisions, issues, experiment):
             queries = [np.nan if row.get("t_mid_s") is None or not resolved else row["t_mid_s"] + decision["dt_s"] for row in frames]
             channel_experiment = channel.get("experiment", experiment)
             phases = label_phases(source["t_s"], channel["values"], queries, channel_experiment,
-                                  channel["kind"], channel.get("phase_tolerance"))
+                                  channel["kind"], channel.get("phase_tolerance"), max_gap_s=channel.get("max_gap_s"))
             for row, values, phase in zip(table, sampled, phases):
                 for key, value in values.items():
                     row[f"{prefix}.{key}"] = value
@@ -249,6 +253,18 @@ def _protect_inputs(request_path, output):
         paths.extend(_path(config[key], base) for key in ("geometry", "mask") if config.get(key))
         if isinstance(config.get("files"), list):
             paths.extend(_path(item["path"], base) for item in config["files"] if isinstance(item, dict) and item.get("path"))
+        sources = request.get("sources")
+        if config.get("type") == "images" and isinstance(sources, list) and any(
+                isinstance(source, dict) and isinstance(source.get("clock"), dict) and
+                (source["clock"].get("method") == "event" or source["clock"].get("event")) for source in sources):
+            try:
+                raw_frames, _ = read_frames(request["frames"], base)
+            except (InputError, KeyError, TypeError):
+                raw_frames = []
+            if raw_frames and not any("eps_hkl" in frame for frame in raw_frames):
+                from .hdf5_sources import discover_dependencies
+
+                paths.extend(Path(path) for path in discover_dependencies(raw_frames)["paths"])
     metadata = request.get("metadata") or {}
     if isinstance(metadata, dict) and metadata.get("sync_markers_file"):
         paths.append(_path(metadata["sync_markers_file"], base))
@@ -292,6 +308,7 @@ def _run_locked(request_path, output):
     stages = Stages(output, state, files)
     frames, sources, table = [], [], []
     features = {"rows": [], "signals": [], "metadata": {}, "issues": []}
+    feature_storage = None
     _not_ready(output, "running", [])
     write_json(output / "status.json", state)
     atomic_text(output / "run.log", f"InSituLink {__version__}\nrequest: {request_path}\n")
@@ -326,6 +343,8 @@ def _run_locked(request_path, output):
         _select(frames, request.get("analysis") or {})
         state.update(n_frames=len(frames), n_selected=sum(r["selected"] for r in frames), frame_metadata=metadata)
         state["frame_metadata_sha256"] = digest({"frames": frames, "metadata": metadata})
+        if metadata.get("frame_count_unresolved"):
+            state["issues"].append({"code": "frame_count_unresolved", "message": metadata["frame_count_unresolved_reason"]})
         if metadata.get("nonmonotonic_rows") or metadata.get("duplicate_time_rows"):
             state["issues"].append({"code": "nonmonotonic_frame_clock", "message": "Frame times repeat or decrease; acquisition order was preserved."})
         evidence_file = (request.get("metadata") or {}).get("sync_markers_file") if isinstance(request.get("metadata"), dict) else None
@@ -343,8 +362,16 @@ def _run_locked(request_path, output):
                 config = request["features"]
                 if config.get("files") is not None and (not isinstance(config["files"], list) or any(not isinstance(item, dict) or not item.get("path") for item in config["files"])):
                     raise InputError("features.files must contain objects with a path")
-                binding = {"config": config, "frames": frames, "dependencies": _preview_dependencies(config, frames, base, files)}
-                features = stages.run("features", binding, lambda: extract_features(config, frames, base, output / ".insitulink" / "preview"), ["preview.py"])
+                dependencies = _preview_dependencies(config, frames, base, files)
+                feature_storage = dependencies["storage"] if config.get("type") == "images" else None
+                binding = {"config": config, "frames": frames, "dependencies": dependencies}
+                modules = ["preview.py", "inputs.py"] + (["hdf5_sources.py"] if feature_storage is not None else [])
+                features = stages.run("features", binding, lambda: extract_features(config, frames, base, output / ".insitulink" / "preview"),
+                                      modules, cacheable=dependencies["storage"]["complete"])
+                features["metadata"]["input_dependencies"] = dependencies
+                if not dependencies["storage"]["complete"]:
+                    state["issues"].append({"code": "unverified_feature_dependencies", "message": "Preanalysis was recomputed without cache reuse, but its storage dependencies remain unverified.",
+                                             "details": dependencies["storage"]["issues"]})
             except InputError as exc:
                 state["issues"].append(exc.as_dict())
         elif not needs_features:
@@ -370,6 +397,11 @@ def _run_locked(request_path, output):
                 row["frame_flags"].append("source_input_unavailable")
         state["n_valid_analysis"] = sum(row["valid_analysis"] for row in table)
         _verify_input_stability(files, output)
+        if feature_storage is not None:
+            from .hdf5_sources import discover_dependencies
+
+            if digest(discover_dependencies(frames)) != digest(feature_storage):
+                raise InputError("Detector storage dependencies changed during alignment", "input_changed")
         if request["frames"].get("type") == "hdf5":
             checked_frames, checked_metadata = read_frames(request["frames"], base)
             _identify(checked_frames)

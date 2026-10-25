@@ -200,32 +200,33 @@ def _onset(t, values, valid, baseline_n, min_run, k_sigma, direction):
     if valid.ndim != 1 or len(valid) != len(y):
         raise InputError("Feature validity length differs", "length_mismatch")
     good = valid & np.isfinite(y)
-    # Missing samples do not provide a baseline or a sustained run.
-    if len(y) < min_run + 2 or not good[:2].all():
+    # The full declared baseline and a later sustained run must be available;
+    # an identical initial pair does not establish the remaining baseline.
+    n = baseline_n
+    if len(y) < n + min_run or not good[:n].all():
         return None, "baseline_missing"
     floor = max(float(np.nanmax(np.abs(y[good]))) * 1e-10, 1e-12) if good.any() else 1e-12
-    stop = min(baseline_n, len(y) - min_run)
-    prefix = 2
-    while prefix < stop and good[prefix] and abs(y[prefix] - y[0]) <= floor:
-        prefix += 1
-    if abs(y[1] - y[0]) <= floor:
-        n = prefix  # Even two static frames establish a baseline.
-    else:
-        n = stop
-        if n < 3 or not good[:n].all():
+    if np.ptp(y[:n]) > floor:
+        if n < 3:
             return None, "baseline_missing"
         diffs = np.diff(y[:n])
         delta = float(np.median(diffs))
         diff_noise = 1.4826 * float(np.median(np.abs(diffs - delta)))
         if abs(delta) > max(k_sigma * diff_noise, floor):
             return None, "initially_changing"
-        # A strong net trend in the baseline is not static evidence.
+        # Monotonic (including quantized) changes and strong net trends do not
+        # establish a static baseline.
         residual = y[:n] - np.linspace(y[0], y[n - 1], n)
         noise = 1.4826 * float(np.median(np.abs(residual - np.median(residual))))
-        if abs(y[n - 1] - y[0]) > max(k_sigma * noise, floor) and np.all(diffs * delta >= 0):
+        monotonic = np.all(diffs >= -floor) or np.all(diffs <= floor)
+        if monotonic or (abs(y[n - 1] - y[0]) > max(k_sigma * noise, floor)
+                         and np.all(diffs * delta >= 0)):
             return None, "initially_changing"
     base = float(np.median(y[:n]))
     noise = 1.4826 * float(np.median(np.abs(y[:n] - base)))
+    # Quantized records can have a zero MAD despite real baseline scatter.
+    if noise == 0 and np.any(y[:n] != base):
+        noise = float(np.std(y[:n]))
     threshold = max(k_sigma * noise, floor)
     signs = (1,) if direction == "rise" else (-1,) if direction == "fall" else (1, -1)
     candidates = []
@@ -304,6 +305,7 @@ def resolve_clock(frames, source, features=None, experiment="generic"):
     channel = source.get("channels", {}).get(channel_name)
     if channel is None:
         return _decision(method, "event_channel_missing", evidence=evidence)
+    experiment = channel.get("experiment", experiment)
     try:
         baseline_n = int(config.get("baseline_samples", 8))
         min_run = int(config.get("min_run", 3))
@@ -361,13 +363,13 @@ def resolve_clock(frames, source, features=None, experiment="generic"):
                      uncertainty=uncertainty, evidence=evidence)
 
 
-def label_phases(t, values, query, experiment="generic", kind="continuous", tolerance=None):
+def label_phases(t, values, query, experiment="generic", kind="continuous", tolerance=None, max_gap_s=None):
     """Label local chronological phases without merging repeated cycles."""
     t = _clock(t)
     y = _series(t, values)
     _kind(kind)
     query = _array(query, "query")
-    gap = _gap_limit(t)
+    gap = _gap_limit(t, max_gap_s)
     dt, dy = np.diff(t), np.diff(y)
     supported = np.isfinite(y[:-1]) & np.isfinite(y[1:]) & (dt <= gap)
     slopes = np.divide(dy, dt)

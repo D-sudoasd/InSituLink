@@ -93,7 +93,7 @@ class Stages:
         self.state = state
         self.files = files
 
-    def run(self, name, binding, function, modules):
+    def run(self, name, binding, function, modules, *, cacheable=True):
         code = [self.files.file(Path(__file__).parent / module) for module in dict.fromkeys(modules + ["storage.py", "errors.py", "__init__.py"])]
         packages = {"numpy"}
         if "inputs.py" in modules:
@@ -108,14 +108,15 @@ class Stages:
                 versions[package] = None
         fingerprint = digest({"binding": binding, "code": code, "dependencies": versions})
         receipt = self.root / f"{name}.json"
-        try:
-            saved = json.loads(receipt.read_text(encoding="utf-8"))
-            if saved["fingerprint"] == fingerprint and saved["result_sha256"] == digest(saved["result"]):
-                self.state["stages"][name] = {"status": "reused", "fingerprint": fingerprint}
-                self._log(name, "reused")
-                return saved["result"]
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
+        if cacheable:
+            try:
+                saved = json.loads(receipt.read_text(encoding="utf-8"))
+                if saved["fingerprint"] == fingerprint and saved["result_sha256"] == digest(saved["result"]):
+                    self.state["stages"][name] = {"status": "reused", "fingerprint": fingerprint}
+                    self._log(name, "reused")
+                    return saved["result"]
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
         started = time.perf_counter()
         self.state["current_stage"] = name
         self.state["stages"][name] = {"status": "running", "fingerprint": fingerprint}
@@ -127,8 +128,10 @@ class Stages:
             self.state["stages"][name] = {"status": "incomplete", "fingerprint": fingerprint}
             self._log(name, "incomplete")
             raise
-        write_json(receipt, {"fingerprint": fingerprint, "result_sha256": digest(result), "result": result})
-        self.state["stages"][name] = {"status": "computed", "fingerprint": fingerprint, "elapsed_s": time.perf_counter() - started}
+        if cacheable:
+            write_json(receipt, {"fingerprint": fingerprint, "result_sha256": digest(result), "result": result})
+        self.state["stages"][name] = {"status": "computed", "fingerprint": fingerprint, "elapsed_s": time.perf_counter() - started,
+                                      "cacheable": cacheable}
         self._log(name, "computed")
         return result
 

@@ -6,6 +6,7 @@ Image readers and integration dependencies are imported only for image input.
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
@@ -13,6 +14,7 @@ from scipy.optimize import least_squares
 from scipy.signal import find_peaks, peak_widths
 
 from .errors import InputError
+from .inputs import canonical_source_file
 
 
 AXES = {"d_A", "q_A^-1", "two_theta_deg"}
@@ -40,6 +42,24 @@ def _path(value, base_dir, role):
 
 def _identity(frame):
     return {key: frame.get(key) for key in ("source_file", "dataset", "frame_index", "original_id")}
+
+
+def _matches(frame, identity):
+    return all((os.path.normcase(frame.get(key) or "") == os.path.normcase(value or ""))
+               if key == "source_file" else frame.get(key) == value
+               for key, value in identity.items())
+
+
+def _canonical_identities(config, frames, base_dir):
+    """Apply the request-relative source rule to copies before comparisons."""
+    def canonical(identity):
+        return {**identity, "source_file": canonical_source_file(identity["source_file"], base_dir)} if "source_file" in identity else dict(identity)
+    frames = [canonical(frame) for frame in frames]
+    config = dict(config)
+    for key in ("files", "baseline_frames"):
+        if isinstance(config.get(key), list):
+            config[key] = [canonical(entry) if isinstance(entry, dict) else entry for entry in config[key]]
+    return config, frames
 
 
 def _noise(y):
@@ -156,15 +176,11 @@ def _spectra(config, frames, base_dir):
         raise InputError("columns must contain two nonnegative column indices", "preview_invalid_config")
     spectra, dependencies = [], []
     for frame in frames:
-        matches = [e for e in entries if e.get("frame_index") == frame["frame_index"] and
-                   ("source_file" not in e or e["source_file"] == frame.get("source_file")) and
-                   ("dataset" not in e or e["dataset"] == frame.get("dataset"))]
+        matches = [e for e in entries if _matches(frame, {k: e[k] for k in ("frame_index", "source_file", "dataset") if k in e})]
         if len(matches) != 1:
             raise InputError("Each frame needs exactly one unambiguous spectrum", "preview_spectrum_identity", frame=_identity(frame))
         entry = matches[0]
-        matched_frames = [f for f in frames if f["frame_index"] == entry["frame_index"] and
-                          ("source_file" not in entry or f.get("source_file") == entry["source_file"]) and
-                          ("dataset" not in entry or f.get("dataset") == entry["dataset"])]
+        matched_frames = [f for f in frames if _matches(f, {k: entry[k] for k in ("frame_index", "source_file", "dataset") if k in entry})]
         if len(matched_frames) != 1:
             raise InputError("Spectrum frame_index needs source_file/dataset disambiguation", "preview_spectrum_identity", frame=_identity(frame))
         path = _path(entry.get("path"), base_dir, "spectrum")
@@ -225,6 +241,11 @@ def _images(config, frames, base_dir, output_dir):
         raise InputError("npt must be an integer >= 12", "preview_invalid_config")
     spectra = []
     cache_paths = []
+    from .hdf5_sources import discover_dependencies
+    storage = discover_dependencies(frames)
+    if not storage["complete"]:
+        raise InputError("Cannot verify all detector storage dependencies", "preview_unverified_image_sources", issues=storage["issues"])
+    dependencies.extend({"path": path, "role": "detector_image"} for path in storage["paths"])
     output_dir.mkdir(parents=True, exist_ok=True)
     for number, frame in enumerate(frames):
         source = _path(frame.get("source_file"), base_dir, "detector_image")
@@ -235,7 +256,7 @@ def _images(config, frames, base_dir, output_dir):
                 with h5py.File(source, "r") as handle:
                     dataset = handle[frame["dataset"]]
                     data = np.asarray(dataset[index] if dataset.ndim == 3 else dataset[()] if dataset.ndim == 2 and index == 0 else [])
-            except (ImportError, KeyError, OSError, IndexError) as exc:
+            except (ImportError, KeyError, OSError, IndexError, ValueError, TypeError, RuntimeError) as exc:
                 raise InputError(f"Cannot read detector frame: {exc}", "preview_invalid_image", frame=_identity(frame)) from exc
         else:
             try:
@@ -268,9 +289,9 @@ def _images(config, frames, base_dir, output_dir):
         cache = output_dir / f"integrated_{number:06d}.npz"
         np.savez_compressed(cache, q_A_inv=q, intensity=intensity)
         cache_paths.append(str(cache))
-        dependencies.append({"path": str(source), "role": "detector_image"})
     return spectra, dependencies, {"wavelength_A": wavelength, "integration_axis": "q_A^-1",
-                                   "azimuth_range": sector, "integrated_files": cache_paths}
+                                   "azimuth_range": sector, "integrated_files": cache_paths,
+                                   "storage_dependencies": storage}
 
 
 def _automatic_windows(spectra, max_peaks, snr_min):
@@ -315,7 +336,7 @@ def _baseline_indices(requested, frames):
         if type(identity) is int:
             matches = [i for i, f in enumerate(frames) if f["frame_index"] == identity]
         elif isinstance(identity, dict) and identity:
-            matches = [i for i, f in enumerate(frames) if all(f.get(k) == v for k, v in identity.items())]
+            matches = [i for i, f in enumerate(frames) if _matches(f, identity)]
         else:
             matches = []
         if len(matches) != 1 or matches[0] in indices:
@@ -338,6 +359,8 @@ def extract_features(config: dict, frames: list[dict], base_dir: Path, output_di
             raise InputError("Every preview frame needs frame_index and finite t_mid_s", "preview_invalid_frame")
         if config["type"] == "images" and not frame.get("source_file"):
             raise InputError("Image preview needs a raw source_file for every frame", "preview_missing_input", field="source_file")
+    base_dir, output_dir = Path(base_dir), Path(output_dir)
+    config, frames = _canonical_identities(config, frames, base_dir)
     if any(right["t_mid_s"] <= left["t_mid_s"] for left, right in zip(frames, frames[1:])):
         raise InputError("Preview frame times must increase in acquisition order", "preview_nonmonotonic_time")
     baseline_indices = _baseline_indices(config.get("baseline_frames"), frames)
@@ -345,7 +368,6 @@ def extract_features(config: dict, frames: list[dict], base_dir: Path, output_di
     max_peaks = config.get("max_peaks", 3)
     if type(max_peaks) is not int or max_peaks < 1:
         raise InputError("max_peaks must be a positive integer", "preview_invalid_config")
-    base_dir, output_dir = Path(base_dir), Path(output_dir)
     reader = _spectra if config["type"] == "spectra" else _images
     spectra, dependencies, extra = reader(config, frames, base_dir) if config["type"] == "spectra" else reader(config, frames, base_dir, output_dir)
     wavelength = extra.get("wavelength_A", config.get("wavelength_A"))

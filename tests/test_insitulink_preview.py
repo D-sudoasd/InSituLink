@@ -1,5 +1,6 @@
 """Deterministic engineering checks for optional diffraction preanalysis."""
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -157,6 +158,14 @@ class SpectraPreviewTests(unittest.TestCase):
         with self.assertRaises(InputError) as raised:
             self.extract(config, frames)
         self.assertEqual(raised.exception.code, "preview_spectrum_identity")
+
+    @unittest.skipUnless(os.name == "nt", "Windows filesystem case semantics")
+    def test_source_identity_comparison_respects_windows_case(self):
+        config, frames = self.series([2., 2.001])
+        config["baseline_frames"] = [{"source_file": "RAW.H5", "frame_index": 0}]
+        for entry in config["files"]:
+            entry["source_file"] = "RAW.H5"
+        self.assertTrue(all(self.extract(config, frames)["signals"][0]["valid"]))
 
 
 @unittest.skipUnless(all(importlib.util.find_spec(name) for name in ("pyFAI", "fabio", "h5py")), "optional image dependencies unavailable")

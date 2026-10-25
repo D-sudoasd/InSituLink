@@ -12,7 +12,7 @@ from unittest.mock import patch
 import numpy as np
 
 from insitulink.errors import InputError
-from insitulink.inputs import read_frames, read_source, referenced_paths
+from insitulink.inputs import canonical_source_file, read_frames, read_source, referenced_paths
 
 try:
     import h5py
@@ -56,6 +56,42 @@ class InputsTest(unittest.TestCase):
         self.assertEqual(meta["duplicate_time_rows"], [2])
         self.assertIsNone(rows[1]["t_mid_s"])
         self.assertIsNone(rows[0]["source_file"])
+
+    def test_source_requires_explicit_file_local_index_including_mapping(self):
+        for index in (None, "", " "):
+            config = {"data": [{"file": "one.tiff", "index": index, "t_start_s": 0}],
+                      "columns": {"source_file": "file", "frame_index": "index"}}
+            with self.subTest(index=index), self.assertRaises(InputError) as caught:
+                read_frames(config, self.base)
+            self.assertEqual(caught.exception.code, "missing_frame_index")
+            self.assertEqual(caught.exception.details["row"], 0)
+            self.assertEqual(caught.exception.details["frame_index_column"], "index")
+        rows, _ = read_frames({"data": [{"source_file": f"{name}.tiff", "frame_index": 0,
+                                        "t_start_s": i} for i, name in enumerate(("one", "two"))]}, self.base)
+        self.assertEqual([r["frame_index"] for r in rows], [0, 0])
+
+    def test_canonical_source_file_preserves_reader_missing_and_path_semantics(self):
+        for value in (None, "", " "):
+            self.assertIsNone(canonical_source_file(value, self.base))
+        expected = str((self.base / "raw.tiff").resolve())
+        self.assertEqual(canonical_source_file("nested/../raw.tiff", self.base), expected)
+        self.assertEqual(canonical_source_file(expected, self.base), expected)
+
+    def test_csv_headers_are_validated_before_reading_values(self):
+        for header, duplicate, empty in (("time,time,T", ["time"], []),
+                                         ("time,T,T", ["T"], []),
+                                         ("frame_id,frame_id,t_start_s", ["frame_id"], []),
+                                         ("time,,T", [], [1]), ("time, ,T", [], [1])):
+            with self.subTest(header=header):
+                (self.base / "bad.csv").write_text(header + "\n0,1,2\n", encoding="utf-8")
+                with self.assertRaises(InputError) as caught:
+                    read_frames({"path": "bad.csv"}, self.base)
+                self.assertEqual(caught.exception.code, "invalid_table_header")
+                self.assertEqual(caught.exception.details["duplicate_columns"], duplicate)
+                self.assertEqual(caught.exception.details["empty_column_positions"], empty)
+        (self.base / "distinct.csv").write_text("time, time\n0,1\n", encoding="utf-8")
+        rows, _ = read_frames({"path": "distinct.csv", "columns": {"start": "time"}}, self.base)
+        self.assertEqual(rows[0][" time"], 1)
 
     def test_missing_time_requires_confirmed_period(self):
         for extra in ({}, {"constant_period": {"exposure_s": 1, "interval_s": 2}},
@@ -218,6 +254,8 @@ class InputsTest(unittest.TestCase):
         self.assertEqual(meta["dropped_padded_indices"], [3, 4])
         self.assertEqual(meta["data_frame_count"], 100_000_000)
         self.assertIn("data_dataset", meta["count_mismatches"])
+        self.assertTrue(meta["frame_count_unresolved"])
+        self.assertEqual(meta["observed_timestamp_frame_count"], 3)
         self.assertEqual(rows[2]["dataset"], "/entry/data/data")
         self.assertEqual(rows[2]["source_file"], str((self.base / "master.h5").resolve()))
 
@@ -326,6 +364,44 @@ class InputsTest(unittest.TestCase):
         rows, meta = read_frames(config, self.base)
         self.assertEqual(len(rows), 1)
         self.assertEqual(meta["dropped_padded_indices"], [1, 2])
+        self.assertFalse(meta["frame_count_unresolved"])
+
+    @unittest.skipIf(h5py is None, "h5py unavailable")
+    def test_hdf5_explicit_count_preserves_tail_and_reconstruction(self):
+        for starts in ([0, np.nan, np.nan], [0], 0.0):
+            for reconstruct in (False, True):
+                with self.subTest(starts=starts, reconstruct=reconstruct):
+                    config = self.hdf5(starts, data_count=3)
+                    config["frame_count"] = 3
+                    if reconstruct:
+                        config["constant_period"] = {"confirmed": True, "interval_s": 1, "exposure_s": .5}
+                    rows, meta = read_frames(config, self.base)
+                    self.assertEqual([r["frame_index"] for r in rows], [0, 1, 2])
+                    self.assertEqual([r["t_start_s"] for r in rows], [0, 1, 2] if reconstruct else [0, None, None])
+                    self.assertEqual(meta["reconstructed_frame_indices"], [1, 2] if reconstruct else [])
+                    self.assertEqual(meta["frame_count_source"], "frame_count")
+                    self.assertFalse(meta["frame_count_unresolved"])
+
+    @unittest.skipIf(h5py is None, "h5py unavailable")
+    def test_hdf5_explicit_count_bounded_before_padding(self):
+        config = self.hdf5([0], data_count=100_000_000)
+        config["frame_count"] = 100_000_000
+        with self.assertRaisesRegex(InputError, "bounded"):
+            read_frames(config, self.base)
+
+    @unittest.skipIf(h5py is None, "h5py unavailable")
+    def test_hdf5_exposure_unit_override_and_origin(self):
+        config = self.hdf5([0], exposure=.5, data_count=1)
+        with h5py.File(self.base / "master.h5", "r+") as file:
+            file["/entry/instrument/detector/count_time"].attrs["units"] = "ms"
+        rows, meta = read_frames(config, self.base)
+        self.assertEqual(rows[0]["exposure_s"], .0005)
+        self.assertEqual(meta["exposure_unit_source"], "exposure_dataset.units")
+        config["exposure_unit"] = "s"
+        rows, meta = read_frames(config, self.base)
+        self.assertEqual(rows[0]["exposure_s"], .5)
+        self.assertEqual(meta["exposure_unit"], "s")
+        self.assertEqual(meta["exposure_unit_source"], "config.exposure_unit")
 
 
 if __name__ == "__main__":

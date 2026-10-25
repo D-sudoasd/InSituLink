@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 from insitulink.errors import InputError
-from insitulink.numerics import label_phases, resolve_clock, sample_channel
+from insitulink.numerics import _onset, label_phases, resolve_clock, sample_channel
 
 
 class ExposureTests(unittest.TestCase):
@@ -173,9 +173,33 @@ class ClockTests(unittest.TestCase):
         self.assertIsNone(result["dt_s"])
         self.assertEqual(result["evidence"]["unavailable_signals"][0]["reason"], "initially_changing")
 
-    def test_two_static_frames_suffice_for_early_onset(self):
+    def test_early_onset_does_not_shorten_declared_baseline(self):
         frames, source, features = fixture(4, onsets=(1,), baseline=1)
+        result = resolve_clock(frames, source, features, "tensile")
+        self.assertIsNone(result["dt_s"])
+        self.assertEqual(result["evidence"]["unavailable_signals"][0]["reason"], "initially_changing")
+
+    def test_explicit_two_sample_static_baseline_can_align_early_onset(self):
+        frames, source, features = fixture(4, onsets=(1,), baseline=1)
+        source["clock"]["baseline_samples"] = 2
         self.assertEqual(resolve_clock(frames, source, features, "tensile")["dt_s"], 4)
+
+    def test_selected_thermal_channel_overrides_top_level_experiment(self):
+        for experiment in ("generic", "tensile"):
+            frames, source, features = fixture(4, onsets=(17,))
+            source["channels"]["force"]["experiment"] = "thermal"
+            source["clock"]["confirmed_same_event"] = True
+            result = resolve_clock(frames, source, features, experiment)
+            self.assertEqual(result["status"], "needs_input")
+            self.assertIsNone(result["dt_s"])
+            self.assertEqual(result["candidate_dt_s"], -1)
+            self.assertTrue(result["evidence"]["physical_response_lag_possible"])
+
+    def test_unselected_temperature_does_not_change_force_event(self):
+        frames, source, features = fixture()
+        source["channels"]["temperature"] = dict(values=[20] * len(source["t_s"]), experiment="thermal")
+        source["channels"]["force"]["experiment"] = "tensile"
+        self.assertEqual(resolve_clock(frames, source, features)["dt_s"], 4)
 
     def test_conflicting_independent_peak_events_are_unresolved(self):
         frames, source, features = fixture(onsets=(12, 18))
@@ -363,6 +387,33 @@ class ClockTests(unittest.TestCase):
                 resolve_clock(frames, source, features)
 
 
+class OnsetBaselineTests(unittest.TestCase):
+    def onset(self, values, baseline=8, min_run=3):
+        return _onset(np.arange(len(values)), values, np.isfinite(values), baseline, min_run, 4, "rise")
+
+    def test_noisy_full_baseline_ignores_identical_initial_pair(self):
+        for second in (0, 0.01):
+            values = [0, second, 1, 1, 1, 0, -1, 0] + [0] * 12 + [10, 12, 14]
+            self.assertEqual(self.onset(values), ((20, 1), "event_found"))
+
+    def test_zero_mad_quantized_baseline_uses_nonzero_scatter(self):
+        values = [0, 0, 0, 0, 0, 1, -1, 0] + [0, 0] + [1] * 3 + [0] * 7 + [10, 12, 14]
+        self.assertEqual(self.onset(values), ((20, 1), "event_found"))
+
+    def test_insufficient_declared_baseline_is_not_clamped(self):
+        self.assertEqual(self.onset([0] * 8 + [10] * 2), (None, "baseline_missing"))
+
+    def test_missing_baseline_sample_is_not_skipped(self):
+        self.assertEqual(self.onset([0, 0, np.nan] + [0] * 5 + [10] * 3), (None, "baseline_missing"))
+
+    def test_initial_static_pair_does_not_hide_baseline_trend(self):
+        for baseline in ([0, 0, 1, 2, 3, 4, 5, 6], [0, 0, 0, 0, 0, 0, 1, 2]):
+            self.assertEqual(self.onset(list(baseline) + [10] * 3), (None, "initially_changing"))
+
+    def test_two_declared_baseline_samples_must_be_static(self):
+        self.assertEqual(self.onset([0, 1, 10, 10, 10], baseline=2), (None, "baseline_missing"))
+
+
 class PhaseTests(unittest.TestCase):
     def test_thermal_cycles_stay_chronological(self):
         t = list(range(11))
@@ -382,6 +433,18 @@ class PhaseTests(unittest.TestCase):
     def test_explicit_noise_tolerance(self):
         self.assertEqual(label_phases([0, 1, 2, 3], [0, 0.001, 0, 1], [0.5, 1.5, 2.5], tolerance=0.01),
                          ["baseline", "baseline", "increasing"])
+
+    def test_explicit_gap_limit_matches_channel_sampling_support(self):
+        t = [0, 1, 2, 10, 11, 12]
+        values = [20 + value for value in t]
+        self.assertEqual(label_phases(t, values, [5.5], "thermal"), ["unknown"])
+        self.assertEqual(label_phases(t, values, [5.5], "thermal", max_gap_s=10), ["heating"])
+        self.assertEqual(label_phases(t, values, [5.5], "thermal", "continuous", 0, 10), ["heating"])
+
+    def test_invalid_explicit_phase_gap_limit_is_rejected(self):
+        for gap in (0, -1, np.nan):
+            with self.subTest(gap=gap), self.assertRaises(InputError):
+                label_phases([0, 1], [0, 1], [0.5], max_gap_s=gap)
 
     def test_default_tolerance_suppresses_noisy_baseline_and_hold(self):
         t = np.arange(161, dtype=float)

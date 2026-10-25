@@ -29,9 +29,9 @@ sample_A_001,0,0.0,0.5,raw/master.h5,/entry/data/data
 sample_A_002,1,0.9,0.6,raw/master.h5,/entry/data/data
 ```
 
-`frame_index` 是该文件/数据集内从 0 开始的索引。单个 TIFF/CBF 文件通常为 0，不是整次扫描的累积编号。`frame_number` 为该索引加 1，`sequence_index` 表示完整采集序列中的位置。不同文件可具有相同索引；同一原始文件/数据集/索引不能重复。没有原始图像时可省略 `source_file`。
+`frame_index` 是该文件/数据集内从 0 开始的索引。引用原始文件的表格行必须显式提供这个索引，不能用整表行号代替。单个 TIFF/CBF 文件通常为 0，不是整次扫描的累积编号。`frame_number` 为该索引加 1，`sequence_index` 表示完整采集序列中的位置。不同文件可具有相同索引；同一原始文件/数据集/索引不能重复。没有原始图像时可省略 `source_file`，此时缺省索引仅表示元数据记录顺序。
 
-通过 `frames.columns` 中的 `id`、`frame_index`、`start`、`exposure`、`source_file`、`dataset` 映射其他表头。JSON 表使用记录数组；可用 `data` 记录数组代替 `path`。外部记录也支持 CSV/XLSX/JSON/内联数组，XLSX 可指定 `sheet`。
+通过 `frames.columns` 中的 `id`、`frame_index`、`start`、`exposure`、`source_file`、`dataset` 映射其他表头。JSON 表使用记录数组；可用 `data` 记录数组代替 `path`。外部记录也支持 CSV/XLSX/JSON/内联数组，XLSX 可指定 `sheet`。CSV 与 XLSX 表头均要求非空且唯一，重复列名会直接要求修正，不静默选择后一列。
 
 ## 时间与 HDF5
 
@@ -50,7 +50,7 @@ HDF5 帧配置：
 }
 ```
 
-路径需与本次 Eiger/NeXus 文件一致。读取时间字段的 `units`、`start`、`scaling_factor` 属性，显式请求配置优先。这里只读取元数据和图像数据集形状，不读取像素。二维数据集表示一帧，三维数据集使用第一维表示物理帧；时间戳不能制造不存在的帧。尾部填充及数量差异保留诊断；内部缺失时间保持原索引。
+路径需与本次 Eiger/NeXus 文件一致。读取时间字段的 `units`、`start`、`scaling_factor` 属性，显式请求配置优先。HDF5 曝光单位按显式 `exposure_unit`、曝光数据集 `units`、默认秒依次选择；元数据记录实际单位和来源。这里只读取元数据和图像数据集形状，不读取像素。二维数据集表示一帧，三维数据集使用第一维表示物理帧；时间戳不能制造不存在的帧。尾部填充及数量差异保留诊断；内部缺失时间保持原索引。
 
 实际时间缺失时，仅在确认采集连续且周期恒定后加入：
 
@@ -58,7 +58,7 @@ HDF5 帧配置：
 {"constant_period": {"confirmed": true, "start_s": 0, "exposure_s": 0.5, "interval_s": 0.9}}
 ```
 
-`interval_s` 是相邻曝光开始时刻之差。重建使用原始文件内索引，并标明来源；多文件序列应提供整次采集的实际时间。
+`interval_s` 是相邻曝光开始时刻之差。重建使用原始文件内索引，并标明来源；多文件序列应提供整次采集的实际时间。HDF5 显式 `frame_count` 在数据集的物理数量范围内决定保留帧数，已确认周期时可重建其中缺失的尾部时间。没有显式数量、且有限时间记录不能确定真实帧与尾部填充边界时，返回 `needs_input` 要求确认数量，而不是宣称已经完整处理。
 
 ## 外部通道与时间偏移
 
@@ -66,7 +66,7 @@ HDF5 帧配置：
 
 - 通道必须声明单位，无量纲用 `1`。不从量值猜测单位，不自动将载荷换算为应力。
 - `kind: continuous` 线性插值；`kind: step` 右连续前值保持。
-- `max_gap_s` 默认是该记录中位采样间隔的三倍，必须为正；缺口和缺失值不被跨越。
+- `max_gap_s` 默认是该记录中位采样间隔的三倍，必须为正；缺口和缺失值不被跨越。曝光采样与阶段标注使用相同的间隔限制。
 - `required` 默认为 `true`，完整曝光覆盖参与 `valid_analysis`；可选通道保留独立有效性。
 - `phase_tolerance` 的单位是通道单位/秒；通道可用 `experiment` 覆盖主实验类型，例如热机械耦合记录中的温度和载荷。
 
@@ -91,7 +91,7 @@ HDF5 帧配置：
 {"method": "event", "channel": "force", "baseline_samples": 8, "min_run": 3, "k_sigma": 4}
 ```
 
-`offset/shared` 要求确认和非空依据。锚点必须是同一物理事件两侧的观测时间，默认按实际中位帧间隔检查一致性。事件检测使用基线和持续变化，可指定 `direction: rise|fall`，结合峰位或晶格应变检查候选。通用实验需要 `confirmed_same_event: true`；变温波形估计始终保留为候选，确认独立依据后改用 offset/anchors 再恢复。
+`offset/shared` 要求确认和非空依据。锚点必须是同一物理事件两侧的观测时间，默认按实际中位帧间隔检查一致性。事件检测完整使用声明的 `baseline_samples`，不会因前两点相等自动缩短基线；MAD 为零而基线仍有波动时使用标准差后备。基线不足或已明显变化时要求补充依据。可指定 `direction: rise|fall`，结合峰位或晶格应变检查候选。事件类型采用所选通道的 `experiment`，未声明时使用顶层类型。通用事件需要 `confirmed_same_event: true`；变温波形估计始终保留为候选，该标志不取消热响应限制。确认独立依据后改用 offset/anchors 再恢复。
 
 ## 按需峰分析
 
@@ -107,7 +107,7 @@ HDF5 帧配置：
 }
 ```
 
-files 应覆盖输入帧序列，索引重复时附加对应 `source_file`。坐标可为 `d_A`、`q_A^-1`、`two_theta_deg`，后者要求 `wavelength_A`。CSV 默认逗号，TXT 默认空白，可配置 `delimiter`、`skiprows`。省略 windows 时从首、中、末谱选择最多三个共同可靠峰。默认基线为前八帧，需确认这些帧代表参考状态。
+files 应覆盖输入帧序列，索引重复时附加对应 `source_file`。谱文件和 `baseline_frames` 身份中的 `source_file` 与帧表使用相同的请求目录解析规则，相对路径与等价绝对路径都可使用，但仍必须唯一对应。坐标可为 `d_A`、`q_A^-1`、`two_theta_deg`，后者要求 `wavelength_A`。CSV 默认逗号，TXT 默认空白，可配置 `delimiter`、`skiprows`。省略 windows 时从首、中、末谱选择最多三个共同可靠峰。默认基线为前八帧，需确认这些帧代表参考状态。
 
 原始二维帧配置：
 
@@ -132,4 +132,4 @@ files 应覆盖输入帧序列，索引重复时附加对应 `source_file`。坐
 
 `completed` 表示本次对齐交付完成，部分帧仍可因覆盖不足无效；`needs_input` 表示依据或输入待补充；`failed` 表示运行或交付失败。`ready_for_integration` 还要求至少有一帧满足所有必需通道，并且这些分析帧均引用存在的原始数据文件。仅有时间表的合成演示可以完成对齐，但不标为可进行真实积分；原因见 `raw_source_issues`。消费者仍需检查运行状态、文件完整性和原始帧/标定预检。
 
-`inspect` 验证输出 SHA-256，不检查源文件；`resume` 重新检查输入与配置后复用有效阶段。只做元数据对齐时不读取图像像素；按需图像预分析的缓存还校验图像、几何与掩膜内容。`truth.json` 不参与估计或恢复。
+`inspect` 验证输出 SHA-256，不检查源文件；`resume` 重新检查输入与配置后复用有效阶段。只做元数据对齐时不读取图像像素。按需图像预分析追踪选中数据集的 master、嵌套外链、VDS 映射及外部存储，将实际数据文件、几何和掩膜内容加入缓存与运行期间变更检查。依赖不能可靠枚举时禁止复用；重新执行仍无法验证时要求补充输入，不发布可交接结果。实际文件路径也受到输出目录保护。`truth.json` 不参与估计或恢复。
