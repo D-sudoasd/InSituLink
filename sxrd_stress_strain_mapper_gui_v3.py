@@ -870,7 +870,7 @@ class ToolTip:
 class StressStrainMapperApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("SXRD 原位谱线 应力-应变映射工具")
+        self.root.title("InSituLink · 参考曲线应力-应变映射工具")
         self.root.geometry("1366x768")
         self.root.minsize(1180, 720)
 
@@ -940,7 +940,7 @@ class StressStrainMapperApp:
         status_bar.columnconfigure(1, weight=0)
         ttk.Label(
             status_bar,
-            text="SXRD 原位谱线 应力-应变映射工具",
+            text="InSituLink · 参考曲线应力-应变映射工具",
             style="AppTitle.TLabel",
         ).grid(row=0, column=0, sticky="w")
         self.wizard_state_label = ttk.Label(status_bar, textvariable=self.wizard_state, style="Muted.TLabel")
