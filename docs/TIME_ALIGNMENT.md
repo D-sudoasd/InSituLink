@@ -1,5 +1,8 @@
 # Frame–stress–strain time alignment
 
+This documents the compatible `strainlink` entry. For the general InSituLink
+request and multi-parameter pipeline, see [REQUEST.md](REQUEST.md).
+
 This path places each diffraction frame on a tensile curve. It does not complete a missing stress or strain by interpolating a reference σ–ε curve. That reference-curve mapper remains `sxrd_stress_strain_mapper_gui_v3.py`.
 
 There is no shared wall clock and no sub-second lock. The residual is about one measured frame interval.
