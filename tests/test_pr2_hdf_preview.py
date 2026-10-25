@@ -1,5 +1,6 @@
 """Selected HDF storage provenance and request-relative preview regressions."""
 import copy
+from contextlib import chdir
 import importlib.util
 import json
 import os
@@ -84,6 +85,51 @@ class StorageDiscoveryTests(unittest.TestCase):
         self.assertFalse(result["complete"])
         self.assertIn(str(self.base / "data.h5"), result["paths"])
         self.assertEqual(result["issues"][0]["code"], "hdf5_missing_storage")
+
+    def test_virtual_collision_binds_all_candidates_and_search_context(self):
+        h5py = self.h5py
+        prefix, cwd = self.base / "prefix", self.base / "cwd"
+        prefix.mkdir()
+        cwd.mkdir()
+        candidates = [directory / "data.h5" for directory in (self.base, prefix, cwd)]
+        for path in candidates:
+            with h5py.File(path, "w") as handle:
+                handle.create_dataset("pixels", shape=(2, 4, 4), dtype="u2")
+        virtual = self.virtual()
+        with chdir(cwd), patch.dict(os.environ, {"HDF5_VDS_PREFIX": str(prefix)}), patch.object(h5py.Dataset, "__getitem__", side_effect=AssertionError("pixel read")):
+            result = self.discover(virtual)
+        self.assertTrue(result["complete"], result)
+        self.assertEqual(result["paths"], sorted(str(p) for p in [virtual, *candidates]))
+        mapping = result["datasets"][0]["virtual_sources"][0]
+        self.assertEqual(mapping["candidate_paths"], sorted(str(p) for p in candidates))
+        # A context change must invalidate a binding even with identical paths.
+        with patch.dict(os.environ, {"HDF5_VDS_PREFIX": ""}):
+            first = self.discover(virtual)
+        with patch.dict(os.environ, {"HDF5_VDS_PREFIX": str(self.base)}):
+            second = self.discover(virtual)
+        self.assertEqual(first["paths"], second["paths"])
+        self.assertNotEqual(first["datasets"], second["datasets"])
+        # One unreadable candidate cannot hide the other known storage files.
+        candidates[1].write_bytes(b"not HDF5")
+        with chdir(cwd), patch.dict(os.environ, {"HDF5_VDS_PREFIX": str(prefix)}):
+            bad = self.discover(virtual)
+        self.assertFalse(bad["complete"])
+        self.assertEqual(bad["paths"], result["paths"])
+
+    def test_external_raw_collision_binds_prefix_and_cwd_files(self):
+        prefix, cwd = self.base / "prefix", self.base / "cwd"
+        prefix.mkdir()
+        cwd.mkdir()
+        raw_paths = [directory / "pixels.raw" for directory in (prefix, cwd)]
+        for raw in raw_paths:
+            raw.write_bytes(bytes(64))
+        path = self.base / "raw.h5"
+        with self.h5py.File(path, "w") as handle:
+            handle.create_dataset("images", shape=(2, 4, 4), dtype="u2", external=[("pixels.raw", 0, 64)])
+        with chdir(cwd), patch.dict(os.environ, {"HDF5_EXTFILE_PREFIX": str(prefix)}):
+            result = self.discover(path)
+        self.assertTrue(result["complete"], result)
+        self.assertEqual(result["paths"], sorted(str(p) for p in [path, *raw_paths]))
 
     def test_unavailable_virtual_enumeration_is_explicitly_incomplete(self):
         virtual = self.virtual()
@@ -216,6 +262,60 @@ class PreviewPipelineRegressions(unittest.TestCase):
         self.assertEqual((output / "peaks.csv").read_bytes(), (self.base / "fresh" / "peaks.csv").read_bytes())
         paths = {item["path"] for item in changed["features"]["metadata"]["dependencies"]}
         self.assertTrue({str(master), str(data)} <= paths)
+
+    def test_virtual_prefix_collision_tracks_actual_pixels_and_protects_output(self):
+        import h5py
+        owner, prefix = self.base / "owner", self.base / "prefix"
+        owner.mkdir()
+        prefix.mkdir()
+        master = owner / "master.h5"
+        owner_data, prefix_data = owner / "data.h5", prefix / "data.h5"
+        for path in (owner_data, prefix_data):
+            with h5py.File(path, "w") as handle:
+                handle.create_dataset("images", data=self.images(10))
+        layout = h5py.VirtualLayout(shape=(24, 192, 192), dtype="f4")
+        layout[:] = h5py.VirtualSource("data.h5", "/images", shape=(24, 192, 192))
+        with h5py.File(master, "w", libver="latest") as handle:
+            handle.create_virtual_dataset("images", layout)
+        frames = [{"frame_index": i, "t_start_s": i, "exposure_s": 1, "source_file": str(master), "dataset": "/images"} for i in range(24)]
+        request = self.write_request(self.request(frames, self.image_config()))
+        output = self.base / "results"
+        with patch.dict(os.environ, {"HDF5_VDS_PREFIX": str(prefix)}):
+            storage = discover_dependencies(frames)
+            self.assertTrue(storage["complete"], storage)
+            self.assertTrue({str(master), str(owner_data), str(prefix_data)} <= set(storage["paths"]))
+            first = run(request, output)
+            self.assertEqual(first["status"], "completed", first["issues"])
+            self.assertAlmostEqual(first["decisions"]["load"]["dt_s"], -.5)
+            self.assertEqual(resume(output)["stages"]["features"]["status"], "reused")
+            self.assertTrue({str(owner_data), str(prefix_data)} <= {item["path"] for item in first["input_files"]})
+            master_bytes, prefix_bytes = master.read_bytes(), prefix_data.read_bytes()
+            with h5py.File(owner_data, "r+") as handle:
+                handle["images"][:] = self.images(14)
+            self.assertEqual(master.read_bytes(), master_bytes)
+            self.assertEqual(prefix_data.read_bytes(), prefix_bytes)
+            changed = resume(output)
+            fresh = run(request, self.base / "fresh")
+            self.assertEqual(changed["status"], "completed", changed["issues"])
+            self.assertEqual(changed["stages"]["features"]["status"], "computed")
+            self.assertEqual(changed["decisions"], fresh["decisions"])
+            # The affected Windows runtime reads the owner's file despite the
+            # configured prefix. On runtimes honoring it, fresh remains -0.5.
+            self.assertIn(fresh["decisions"]["load"]["dt_s"], (-.5, -4.5))
+            self.assertEqual((output / "peaks.csv").read_bytes(), (self.base / "fresh" / "peaks.csv").read_bytes())
+            # Both candidates are protected, including owner data under output.
+            saved = owner_data.read_bytes()
+            with self.assertRaises(InputError):
+                run(request, owner)
+            self.assertEqual(owner_data.read_bytes(), saved)
+        # Removing a redundant prefix changes the search context while retaining
+        # both candidate files (prefix equals owner in both cases below).
+        with patch.dict(os.environ, {"HDF5_VDS_PREFIX": str(owner)}):
+            context_first = run(request, self.base / "context")
+        with patch.dict(os.environ, {"HDF5_VDS_PREFIX": ""}):
+            context_changed = resume(self.base / "context")
+        self.assertEqual(context_first["status"], "completed", context_first["issues"])
+        self.assertEqual(context_changed["stages"]["features"]["status"], "computed")
 
     def test_relative_spectrum_and_baseline_identities_match_absolute_pipeline(self):
         import fabio

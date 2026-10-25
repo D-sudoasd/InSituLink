@@ -40,20 +40,26 @@ class _Discovery:
         return self.files[key]
 
     def locate(self, filename, owner, kind, prefix=""):
-        """Apply HDF5's ordinary filesystem search, retaining missing targets."""
+        """Bind plausible storage files without guessing the VDS search winner.
+
+        HDF5 builds can differ in whether environment prefixes take effect for
+        VDS and external raw storage. Bind every existing candidate in those
+        cases; an external link is separately checked against the opened object.
+        """
         filename = _text(filename)
         if not filename or "%" in filename or "${" in filename:
             self.issue("hdf5_dynamic_source", "Cannot enumerate dynamic HDF5 storage names", filename=filename, owner=owner, kind=kind)
-            return None
+            return []
         name = Path(filename)
         if kind == "external_raw":
             # H5Pset_efile_prefix defaults to cwd, not the HDF5 file directory.
-            prefix = os.environ.get("HDF5_EXTFILE_PREFIX", prefix)
-            prefix = prefix.replace("${ORIGIN}", str(Path(owner).parent))
-            if "${" in prefix:
-                self.issue("hdf5_unresolved_prefix", "Cannot resolve external storage prefix", prefix=prefix, owner=owner)
-                return None
-            candidates = [name if name.is_absolute() else Path(prefix) / name]
+            candidates = []
+            for candidate_prefix in (os.environ.get("HDF5_EXTFILE_PREFIX", ""), prefix, ""):
+                candidate_prefix = candidate_prefix.replace("${ORIGIN}", str(Path(owner).parent))
+                if "${" in candidate_prefix:
+                    self.issue("hdf5_unresolved_prefix", "Cannot resolve external storage prefix", prefix=candidate_prefix, owner=owner)
+                    continue
+                candidates.append(name if name.is_absolute() else Path(candidate_prefix) / name)
         else:
             candidates = [name] if name.is_absolute() else []
             if name.is_absolute() and not name.is_file():
@@ -61,20 +67,31 @@ class _Discovery:
             if not name.is_absolute():
                 env = os.environ.get("HDF5_EXT_PREFIX" if kind == "external_link" else "HDF5_VDS_PREFIX", "")
                 prefixes = env.split(os.pathsep) if kind == "external_link" else [env]
-                candidates.extend(Path(p) / name for p in prefixes if p)
-                if prefix:
-                    candidates.append(Path(prefix) / name)
+                for candidate_prefix in [*prefixes, prefix]:
+                    if not candidate_prefix:
+                        continue
+                    candidate_prefix = candidate_prefix.replace("${ORIGIN}", str(Path(owner).parent))
+                    if "${" in candidate_prefix:
+                        self.issue("hdf5_unresolved_prefix", "Cannot resolve HDF5 search prefix", prefix=candidate_prefix, owner=owner)
+                        continue
+                    candidates.append(Path(candidate_prefix) / name)
                 candidates.extend((Path(owner).parent / name, name))
+        found = []
         for candidate in candidates:
             if candidate.is_file():
                 resolved = _canonical(candidate)
                 self.paths.add(resolved)
-                return resolved
+                if resolved not in found:
+                    found.append(resolved)
+                if kind == "external_link":
+                    return found
+        if found:
+            return sorted(found)
         # Keep the expected path even when HDF5 would silently supply fill data.
         missing = _canonical(candidates[0])
         self.paths.add(missing)
         self.issue("hdf5_missing_storage", "HDF5 storage file is unavailable", path=missing, owner=owner, kind=kind)
-        return None
+        return []
 
     def resolve(self, handle, name, active=()):
         name = posixpath.normpath("/" + name.lstrip("/"))
@@ -94,9 +111,9 @@ class _Discovery:
                 return self.resolve(handle, posixpath.join(target, *remaining), active)
             if isinstance(link, self.h5py.ExternalLink):
                 target_file = self.locate(link.filename, owner, "external_link")
-                if target_file is None:
+                if not target_file:
                     return None
-                return self.resolve(self.open(target_file), posixpath.join(link.path, *remaining), active)
+                return self.resolve(self.open(target_file[0]), posixpath.join(link.path, *remaining), active)
             if not isinstance(link, self.h5py.HardLink):
                 self.issue("hdf5_unresolved_link", "Selected HDF5 object path is unavailable or unsupported", path=owner, dataset=name)
                 return None
@@ -132,27 +149,35 @@ class _Discovery:
             return
         self.active.add(key)
         try:
-            record = {"path": actual, "dataset": obj.name, "shape": list(obj.shape), "dtype": str(obj.dtype)}
+            record = {"path": actual, "dataset": obj.name, "shape": list(obj.shape), "dtype": str(obj.dtype),
+                      "search_context": {"cwd": str(Path.cwd()),
+                                         **{key: os.environ.get(key) for key in ("HDF5_EXT_PREFIX", "HDF5_VDS_PREFIX", "HDF5_EXTFILE_PREFIX")}}}
             self.datasets.append(record)
             access = obj.id.get_access_plist()
             external = obj.external
             if external:
                 prefix = _text(access.get_efile_prefix())
+                record["search_context"]["external_access_prefix"] = prefix
                 record["external"] = [{"filename": _text(n), "offset": int(o), "size": int(s)} for n, o, s in external]
-                for filename, _, _ in external:
-                    self.locate(filename, actual, "external_raw", prefix)
+                for entry in record["external"]:
+                    entry["candidate_paths"] = self.locate(entry["filename"], actual, "external_raw", prefix)
             if obj.is_virtual:
                 prefix = _text(access.get_virtual_prefix())
+                record["search_context"]["virtual_access_prefix"] = prefix
                 mappings = obj.virtual_sources()
                 record["virtual_sources"] = [{"filename": _text(m.file_name), "dataset": _text(m.dset_name)} for m in mappings]
-                for mapping in mappings:
-                    filename, dataset = _text(mapping.file_name), _text(mapping.dset_name)
+                for mapping in record["virtual_sources"]:
+                    filename, dataset = mapping["filename"], mapping["dataset"]
                     if not dataset or "%" in dataset:
                         self.issue("hdf5_dynamic_source", "Cannot enumerate dynamic virtual dataset names", path=actual, dataset=dataset)
                         continue
-                    source = actual if filename == "." else self.locate(filename, actual, "virtual", prefix)
-                    if source is not None:
-                        self.visit(self.open(source), dataset)
+                    candidates = [actual] if filename == "." else self.locate(filename, actual, "virtual", prefix)
+                    mapping["candidate_paths"] = candidates
+                    for source in candidates:
+                        try:
+                            self.visit(self.open(source), dataset)
+                        except Exception as exc:
+                            self.issue("hdf5_dependency_unavailable", f"Cannot inspect virtual source candidate: {exc}", path=source, dataset=dataset)
             self.visited.add(key)
         finally:
             self.active.remove(key)
