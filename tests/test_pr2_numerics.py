@@ -110,6 +110,37 @@ class NumericalPipelineRegressions(unittest.TestCase):
         self.assertEqual(float(rows[0]["furnace.temperature.mean"]), 25.5)
         self.assertEqual(rows[0]["furnace.temperature.phase"], "heating")
 
+    def test_slow_ramp_threshold_bias_remains_candidate_in_delivery(self):
+        request = self.event_request()
+        request["frames"]["data"] = [
+            {"frame_index": i, "t_start_s": i, "exposure_s": 0,
+             "eps_hkl": max(i - 20, 0) * 1e-5} for i in range(100)]
+        noise = [-1, .3, -.4, .7, -.8, .5, -.2, .1]
+        request["sources"][0]["data"] = [
+            {"time": i, "force": noise[i] if i < 8 else max(i - 20, 0) * .1}
+            for i in range(100)]
+        status, rows = self.run_request(request)
+        self.assertEqual(status["status"], "needs_input")
+        decision = status["decisions"]["device"]
+        self.assertIsNone(decision["dt_s"])
+        self.assertEqual(decision["candidate_dt_s"], 26)
+        self.assertEqual(decision["reason"], "event_threshold_timing_ambiguous")
+        self.assertEqual(rows[20]["device.force.mid"], "")
+        self.assertEqual(rows[20]["valid_analysis"], "False")
+
+    def test_event_gap_cannot_publish_shifted_parameters(self):
+        request = self.event_request(onset=9)
+        source = request["sources"][0]
+        source["channels"][0]["max_gap_s"] = 1.1
+        source["data"] = [
+            {"time": i, "force": 0 if i < 9 else 10}
+            for i in list(range(9)) + list(range(11, 70))]
+        status, rows = self.run_request(request)
+        self.assertEqual(status["status"], "needs_input")
+        self.assertEqual(status["decisions"]["device"]["reason"], "source_event_crosses_gap")
+        self.assertIsNone(status["decisions"]["device"]["dt_s"])
+        self.assertTrue(all(row["device.force.valid"] == "False" for row in rows))
+
 
 if __name__ == "__main__":
     unittest.main()

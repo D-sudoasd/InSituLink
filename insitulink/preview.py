@@ -5,6 +5,9 @@ Image readers and integration dependencies are imported only for image input.
 """
 from __future__ import annotations
 
+import bz2
+import gzip
+from io import BytesIO
 from pathlib import Path
 import os
 
@@ -18,6 +21,10 @@ from .inputs import canonical_source_file
 
 
 AXES = {"d_A", "q_A^-1", "two_theta_deg"}
+# Preserve existing frame/custom columns in peak rows. Only the new declaration
+# and nested provenance records belong exclusively to frame_records/manifest.
+_FRAME_PROVENANCE_FIELDS = frozenset({"source_file_declared", "dataset_declared", "declared_source",
+                                     "time_provenance", "physical_source", "identity_issues"})
 
 
 def _positive(value, name):
@@ -165,7 +172,7 @@ def _to_d(center, sigma, axis, wavelength):
     return float(d), float(abs(d/np.tan(theta)*np.pi/360*sigma))
 
 
-def _spectra(config, frames, base_dir):
+def _spectra(config, frames, base_dir, source_bytes=None):
     entries = config.get("files")
     if not isinstance(entries, list) or not entries:
         raise InputError("Supply spectra files with frame_index and path", "preview_missing_spectra")
@@ -186,8 +193,19 @@ def _spectra(config, frames, base_dir):
         path = _path(entry.get("path"), base_dir, "spectrum")
         delimiter = entry.get("delimiter", config.get("delimiter", "," if path.suffix.lower() == ".csv" else None))
         skip = entry.get("skiprows", config.get("skiprows", config.get("header_rows", 0)))
+        if source_bytes is not None and str(path) not in source_bytes:
+            raise InputError("Captured spectrum bytes are missing", "preview_missing_snapshot", path=str(path))
         try:
-            data = np.loadtxt(path, delimiter=delimiter, skiprows=skip, usecols=columns, ndmin=2)
+            content = path
+            if source_bytes is not None:
+                payload = source_bytes[str(path)]
+                # Match loadtxt's path-based support for compressed text files.
+                if path.suffix.lower() == ".gz":
+                    payload = gzip.decompress(payload)
+                elif path.suffix.lower() == ".bz2":
+                    payload = bz2.decompress(payload)
+                content = BytesIO(payload)
+            data = np.loadtxt(content, delimiter=delimiter, skiprows=skip, usecols=columns, ndmin=2)
         except (OSError, ValueError, TypeError) as exc:
             raise InputError(f"Cannot read spectrum {path}: {exc}", "preview_invalid_spectrum", path=str(path)) from exc
         spectra.append((data[:, 0], data[:, 1]))
@@ -345,8 +363,15 @@ def _baseline_indices(requested, frames):
     return indices
 
 
-def extract_features(config: dict, frames: list[dict], base_dir: Path, output_dir: Path) -> dict:
-    """Extract valid peak positions and baseline-relative lattice-spacing shifts."""
+def extract_features(config: dict, frames: list[dict], base_dir: Path, output_dir: Path,
+                     *, source_bytes: dict[str, bytes] | None = None) -> dict:
+    """Extract valid peak positions and baseline-relative lattice-spacing shifts.
+
+    For spectra, source_bytes optionally supplies the exact captured contents,
+    keyed by canonical absolute path. A supplied mapping must cover every input
+    spectrum; it never falls back to reopening an unbound file. Image inputs
+    keep their existing readers and do not use this argument.
+    """
     if not isinstance(config, dict) or config.get("type") not in ("spectra", "images"):
         raise InputError("Supply preview type spectra or images", "preview_missing_config")
     axis = config.get("axis", "q_A^-1" if config["type"] == "images" else None)
@@ -368,8 +393,10 @@ def extract_features(config: dict, frames: list[dict], base_dir: Path, output_di
     max_peaks = config.get("max_peaks", 3)
     if type(max_peaks) is not int or max_peaks < 1:
         raise InputError("max_peaks must be a positive integer", "preview_invalid_config")
-    reader = _spectra if config["type"] == "spectra" else _images
-    spectra, dependencies, extra = reader(config, frames, base_dir) if config["type"] == "spectra" else reader(config, frames, base_dir, output_dir)
+    if config["type"] == "spectra":
+        spectra, dependencies, extra = _spectra(config, frames, base_dir, source_bytes)
+    else:
+        spectra, dependencies, extra = _images(config, frames, base_dir, output_dir)
     wavelength = extra.get("wavelength_A", config.get("wavelength_A"))
     if axis == "two_theta_deg":
         wavelength = _positive(wavelength, "wavelength_A")
@@ -402,7 +429,8 @@ def extract_features(config: dict, frames: list[dict], base_dir: Path, output_di
             d, sigma = _to_d(fit["center"], fit["center_sigma"], axis, wavelength) if fit["status"] == "valid" else (None, None)
             if fit["status"] == "valid" and d is None:
                 fit["status"], fit["reason"] = "invalid", "nonphysical_position"
-            peak_rows.append({**frame, **fit, "peak_id": window["id"], "axis": axis, "d_A": d,
+            peak_frame = {key: value for key, value in frame.items() if key not in _FRAME_PROVENANCE_FIELDS}
+            peak_rows.append({**peak_frame, **fit, "peak_id": window["id"], "axis": axis, "d_A": d,
                               "d_sigma_A": sigma, "strain": None})
         baseline = [peak_rows[i] for i in baseline_indices]
         good = [row for row in baseline if row["status"] == "valid"]
