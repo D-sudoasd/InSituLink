@@ -141,6 +141,102 @@ class InputsTest(unittest.TestCase):
         with self.assertRaises(InputError):
             read_frames({"data": [{"t_start_s": 0}], "time": {"unit": "fortnight"}}, self.base)
 
+    def test_epoch_nanosecond_frames_preserve_exposure_and_time_order(self):
+        rows, meta = read_frames({"data": [{"t_start_s": value, "exposure_s": "0.0000001"}
+                                           for value in (0, 100, 200)],
+            "time": {"unit": "ns", "start": "2026-01-01T00:00:00Z"}}, self.base)
+        self.assertEqual([r["t_start_rel_s"] for r in rows], [0, 1e-7, 2e-7])
+        self.assertEqual([r["t_end_rel_s"] for r in rows], [1e-7, 2e-7, 3e-7])
+        self.assertEqual([r["t_mid_rel_s"] for r in rows], [5e-8, 1.5e-7, 2.5e-7])
+        self.assertFalse(meta["duplicate_time_rows"])
+        self.assertFalse(meta["nonmonotonic_rows"])
+        self.assertEqual(rows[0]["time_provenance"]["raw_value"], 0)
+        self.assertIn("approximate", meta["time_provenance"]["precision_note"])
+
+    def test_large_integer_ticks_and_iso_fraction_are_not_rounded_first(self):
+        origin = 1767225600000000000
+        rows, _ = read_frames({"data": [{"t_start_s": origin + value, "exposure_s": 1e-9}
+                                         for value in (1, 2, 3)], "time": {"unit": "ns"}}, self.base)
+        self.assertEqual([r["t_start_rel_s"] for r in rows], [0, 1e-9, 2e-9])
+        self.assertEqual(rows[0]["time_provenance"]["raw_value"], origin + 1)
+        rows, _ = read_frames({"data": [
+            {"t_start_s": "2026-01-01T08:00:00.000000001+08:00", "exposure_s": 1e-9},
+            {"t_start_s": "2026-01-01T00:00:00.000000002Z", "exposure_s": 1e-9}]}, self.base)
+        self.assertEqual(rows[0]["time_origin_s"], "1767225600.000000001")
+        self.assertEqual(rows[1]["t_start_rel_s"], 1e-9)
+        self.assertEqual(rows[1]["t_mid_rel_s"], 1.5e-9)
+
+    def test_json_fractional_seconds_are_parsed_before_float_conversion(self):
+        captured = b'[{"t_start_s":1767225600.000000001,"exposure_s":0.000000001,"eps_hkl":0.001},{"t_start_s":1767225600.000000002,"exposure_s":0.000000001}]'
+        rows, _ = read_frames({"path": "clock.json"}, self.base, table_bytes=captured)
+        self.assertEqual(rows[0]["time_provenance"]["raw_value"], "1767225600.000000001")
+        self.assertEqual(rows[1]["t_start_rel_s"], 1e-9)
+        self.assertEqual(rows[0]["eps_hkl"], .001)
+        json.dumps(rows, allow_nan=False)
+
+    def test_mixed_numeric_and_iso_requires_explicit_numeric_origin(self):
+        records = [{"t_start_s": 0}, {"t_start_s": "2026-01-01T00:00:01Z"}]
+        with self.assertRaises(InputError) as caught:
+            read_frames({"data": records}, self.base)
+        self.assertEqual(caught.exception.code, "mixed_time_basis")
+        rows, _ = read_frames({"data": records, "time": {"start": "2026-01-01T00:00:00Z"}}, self.base)
+        self.assertEqual([r["t_start_rel_s"] for r in rows], [0, 1])
+        source = self.source(data=[{"time": r["t_start_s"], "T": 20} for r in records])
+        with self.assertRaises(InputError) as caught:
+            read_source(source, self.base)
+        self.assertEqual(caught.exception.code, "mixed_time_basis")
+
+    def test_external_epoch_nanoseconds_use_local_clock_for_monotonicity(self):
+        source = read_source(self.source(data=[{"time": value, "T": index} for index, value in enumerate((0, 100, 200))],
+                             time={"unit": "ns", "start": "2026-01-01T00:00:00Z"}), self.base)
+        np.testing.assert_array_equal(source["t_rel_s"], [0, 1e-7, 2e-7])
+        self.assertEqual(source["source_row_numbers"], [1, 2, 3])
+        self.assertEqual(source["metadata"]["time_provenance"]["raw_values"], [0, 100, 200])
+
+    def test_reconstructed_epoch_nanoseconds_preserve_local_exposure(self):
+        rows, meta = read_frames({"data": [{"t_start_s": 0}, {"t_start_s": None}],
+            "time": {"unit": "ns", "start": "2026-01-01T00:00:00Z"},
+            "constant_period": {"confirmed": True, "exposure_s": "0.0000001", "interval_s": "0.0000002"}}, self.base)
+        self.assertEqual([r["t_start_rel_s"] for r in rows], [0, 2e-7])
+        self.assertEqual(rows[1]["t_end_rel_s"], 3e-7)
+        self.assertTrue(rows[1]["time_provenance"]["reconstructed"])
+        self.assertIsNone(rows[1]["time_provenance"]["raw_value"])
+        self.assertEqual(meta["reconstructed_rows"], [1])
+
+    def test_csv_snapshot_retains_original_time_text_and_physical_row_numbers(self):
+        captured = b'when,exposure_s,T\n\n00100,0.0000001,20\n00200,0.0000001,21\n'
+        (self.base / "times.csv").write_text("wrong,file\n0,1\n", encoding="utf-8")
+        config = {"path": "times.csv", "columns": {"start": "when"}, "time": {"unit": "ns"}}
+        rows, meta = read_frames(config, self.base, table_bytes=captured)
+        self.assertEqual([r["source_row_number"] for r in rows], [3, 4])
+        self.assertEqual(rows[0]["time_provenance"]["raw_value"], "00100")
+        self.assertEqual(rows[0]["time_provenance"]["field"], "when")
+        self.assertEqual(rows[0]["time_provenance"]["setting_sources"]["unit"], "request.time.unit")
+        self.assertEqual(meta["source"], str(self.base / "times.csv"))
+        source = read_source({"id": "log", "path": "times.csv", "time_column": "when", "time": {"unit": "ns"},
+                              "channels": [{"name": "T", "unit": "K"}]}, self.base, table_bytes=captured)
+        self.assertEqual(source["source_row_numbers"], [3, 4])
+        self.assertEqual(source["metadata"]["time_provenance"]["raw_values"], ["00100", "00200"])
+
+    def test_source_root_and_json_snapshot_preserve_frame_path_base(self):
+        captured = json.dumps([{"source_file": "raw.tiff", "frame_index": 0, "t_start_s": 0}]).encode()
+        config = {"path": "frames.json", "source_root": "original"}
+        rows, _ = read_frames(config, self.base, table_bytes=captured)
+        expected = self.base / "original" / "raw.tiff"
+        self.assertEqual(rows[0]["source_file"], str(expected))
+        self.assertEqual(rows[0]["source_file_declared"], "raw.tiff")
+        self.assertEqual(referenced_paths(config, self.base, table_bytes=captured), [self.base / "frames.json", expected])
+
+    def test_missing_iso_time_reconstruction_requires_an_absolute_origin(self):
+        config = {"data": [{"t_start_s": "2026-01-01T00:00:00Z"}, {}],
+                  "constant_period": {"confirmed": True, "exposure_s": .5, "interval_s": 1}}
+        with self.assertRaises(InputError) as caught:
+            read_frames(config, self.base)
+        self.assertEqual(caught.exception.code, "mixed_time_basis")
+        config["constant_period"]["start_s"] = "1767225600"
+        rows, _ = read_frames(config, self.base)
+        self.assertEqual([r["t_start_rel_s"] for r in rows], [0, 1])
+
     def test_json_and_original_input_preserved(self):
         data = [{"t_start_s": 0, "frame_id": "raw", "temperature": 300}]
         (self.base / "frames.json").write_text(json.dumps(data), encoding="utf-8")
@@ -160,6 +256,24 @@ class InputsTest(unittest.TestCase):
         rows, _ = read_frames({"path": "frames.xlsx", "sheet": "frames", "columns": {"start": "when"}}, self.base)
         self.assertEqual(rows[0]["original_id"], "x")
         self.assertAlmostEqual(rows[0]["exposure_s"], .2)
+
+    @unittest.skipIf(openpyxl is None, "openpyxl unavailable")
+    def test_xlsx_snapshot_retains_sheet_row_positions(self):
+        book = openpyxl.Workbook()
+        book.active.title = "clock"
+        book.active.append(["time", "T"])
+        book.active.append([None, None])
+        book.active.append([0, 20])
+        book.active.append([1, 21])
+        path = self.base / "log.xlsx"
+        book.save(path)
+        book.close()
+        captured = path.read_bytes()
+        path.write_bytes(b"changed after capture")
+        source = read_source({"id": "log", "path": "log.xlsx", "sheet": "clock",
+                              "channels": [{"name": "T", "unit": "K"}]}, self.base, table_bytes=captured)
+        self.assertEqual(source["source_row_numbers"], [3, 4])
+        np.testing.assert_array_equal(source["t_s"], [0, 1])
 
     def source(self, **updates):
         return {"id": "thermal", "data": [{"time": 0, "T": 20}, {"time": 1, "T": 21}],
@@ -270,6 +384,31 @@ class InputsTest(unittest.TestCase):
         self.assertAlmostEqual(rows[1]["exposure_s"], .2)
         self.assertIsNone(rows[2]["exposure_s"])
         self.assertIn("exposure_dataset", meta["count_mismatches"])
+
+    @unittest.skipIf(h5py is None, "h5py unavailable")
+    def test_hdf5_nanosecond_integer_metadata_and_raw_provenance(self):
+        config = self.hdf5(np.array([0, 100, 200], dtype=np.int64), exposure=100, data_count=3,
+                          attrs={"units": "ns", "start": "2026-01-01T00:00:00.000000001Z"})
+        with h5py.File(self.base / "master.h5", "r+") as file:
+            file["/entry/instrument/detector/count_time"].attrs["units"] = "ns"
+        rows, meta = read_frames(config, self.base)
+        self.assertEqual(rows[0]["time_origin_s"], "1767225600.000000001")
+        self.assertEqual([r["t_start_rel_s"] for r in rows], [0, 1e-7, 2e-7])
+        self.assertEqual([r["t_end_rel_s"] for r in rows], [1e-7, 2e-7, 3e-7])
+        self.assertEqual(rows[1]["time_provenance"]["raw_value"], 100)
+        self.assertEqual(rows[1]["time_provenance"]["field"], "/entry/instrument/detector/start_time")
+        self.assertEqual(rows[0]["time_provenance"]["exposure"]["raw_value"], 100)
+        self.assertEqual(meta["time"]["sources"]["start"], "timestamp_dataset.start")
+
+    @unittest.skipIf(h5py is None, "h5py unavailable")
+    def test_hdf5_scalar_iso_nanoseconds_reconstruct_without_epoch_rounding(self):
+        config = self.hdf5(np.bytes_("2026-01-01T00:00:00.000000001Z"), exposure=1e-9, data_count=3)
+        config["constant_period"] = {"confirmed": True, "exposure_s": "0.000000001", "interval_s": "0.000000002"}
+        rows, meta = read_frames(config, self.base)
+        self.assertEqual([r["t_start_rel_s"] for r in rows], [0, 2e-9, 4e-9])
+        self.assertEqual([r["t_end_rel_s"] for r in rows], [1e-9, 3e-9, 5e-9])
+        self.assertEqual(rows[0]["time_origin_s"], "1767225600.000000001")
+        self.assertEqual(meta["reconstructed_rows"], [1, 2])
 
     @unittest.skipIf(h5py is None, "h5py unavailable")
     def test_hdf5_units_since_and_explicit_override(self):
@@ -402,6 +541,7 @@ class InputsTest(unittest.TestCase):
         self.assertEqual(rows[0]["exposure_s"], .5)
         self.assertEqual(meta["exposure_unit"], "s")
         self.assertEqual(meta["exposure_unit_source"], "config.exposure_unit")
+        self.assertEqual(rows[0]["time_provenance"]["exposure"]["raw_unit"], "ms")
 
 
 if __name__ == "__main__":

@@ -59,19 +59,36 @@ def _gap_limit(t, max_gap_s=None):
     return limit
 
 
-def _point(t, y, q, kind, gap):
+def _point_support(t, y, q, kind, gap):
+    """Return value-contributing rows and weights, plus the support interval."""
     if q < t[0] or q > t[-1]:
-        return None
+        return (), (), None, "outside_record"
     i = int(np.searchsorted(t, q, side="right")) - 1
     if t[i] == q:
-        return float(y[i]) if np.isfinite(y[i]) else None
-    if i + 1 >= len(t) or t[i + 1] - t[i] > gap or not np.isfinite(y[i]):
-        return None
+        return ((i,), (1.,), [i, i], "exact") if np.isfinite(y[i]) else ((), (), [i, i], "nonfinite")
+    bracket = [i, i + 1]
+    if i + 1 >= len(t) or t[i + 1] - t[i] > gap:
+        return (), (), bracket, "gap"
+    if not np.isfinite(y[i]):
+        return (), (), bracket, "nonfinite"
     if kind == "step":
-        return float(y[i])
+        return (i,), (1.,), bracket, "held"
     if not np.isfinite(y[i + 1]):
-        return None
-    return float(y[i] + (y[i + 1] - y[i]) * ((q - t[i]) / (t[i + 1] - t[i])))
+        return (), (), bracket, "nonfinite"
+    weight = float((q - t[i]) / (t[i + 1] - t[i]))
+    return (i, i + 1), (1 - weight, weight), bracket, "interpolated"
+
+
+def _point(t, y, q, kind, gap):
+    indices, weights, _, _ = _point_support(t, y, q, kind, gap)
+    return float(sum(y[i] * w for i, w in zip(indices, weights))) if indices else None
+
+
+def _append_interval_range(ranges, index):
+    if ranges and ranges[-1][1] == index - 1:
+        ranges[-1][1] = index
+    else:
+        ranges.append([index, index])
 
 
 def sample_channel(t, values, starts, ends, offset_s=0.0, kind="continuous", max_gap_s=None):
@@ -97,7 +114,23 @@ def sample_channel(t, values, starts, ends, offset_s=0.0, kind="continuous", max
     gap = _gap_limit(t, max_gap_s)
     rows = []
     for a, b in zip(shifted_starts, shifted_ends):
-        mid = _point(t, y, a + (b - a) / 2, kind, gap)
+        query = float(a + (b - a) / 2)
+        indices, weights, bracket, point_status = _point_support(t, y, query, kind, gap)
+        mid = float(sum(y[i] * w for i, w in zip(indices, weights))) if indices else None
+        exposure = dict(start_s=float(a), end_s=float(b), overlapping_row_range=None,
+                        supported_interval_row_ranges=[], supported_duration_s=0.,
+                        statistics_definition="time_weighted_over_exposure")
+        provenance = dict(
+            model="piecewise_linear" if kind == "continuous" else "previous_sample_hold",
+            model_definition=("Linear between adjacent finite samples within max_gap_s."
+                              if kind == "continuous" else
+                              "Right-continuous value y[i] on [t[i], t[i+1]) within max_gap_s."),
+            time_coordinate="source_local_seconds", offset_s=offset,
+            max_gap_s=float(gap) if np.isfinite(gap) else None,
+            row_index_definition="zero_based_source_data_row; interval ranges include both left-end row indices",
+            midpoint=dict(query_s=query, status=point_status, bracket_row_indices=bracket,
+                          support=[dict(row_index=i, time_s=float(t[i]), value=float(y[i]), weight=w)
+                                   for i, w in zip(indices, weights)]), exposure=exposure)
         flags = []
         if a < t[0]:
             flags.append("before_record")
@@ -108,7 +141,7 @@ def sample_channel(t, values, starts, ends, offset_s=0.0, kind="continuous", max
             if not full and not flags:
                 flags.append("nonfinite" if np.any((t == a) & ~np.isfinite(y)) else "gap")
             rows.append(dict(mid=mid, mean=mid, min=mid, max=mid, coverage=float(full),
-                             valid=full, flags=flags))
+                             valid=full, flags=flags, provenance=provenance))
             continue
         area, covered, extrema = 0.0, 0.0, []
         first = max(0, int(np.searchsorted(t, a, side="right")) - 1)
@@ -117,6 +150,10 @@ def sample_channel(t, values, starts, ends, offset_s=0.0, kind="continuous", max
             lo, hi = max(a, t[i]), min(b, t[i + 1])
             if hi <= lo:
                 continue
+            if exposure["overlapping_row_range"] is None:
+                exposure["overlapping_row_range"] = [i, i + 1]
+            else:
+                exposure["overlapping_row_range"][1] = i + 1
             if t[i + 1] - t[i] > gap:
                 if "gap" not in flags:
                     flags.append("gap")
@@ -131,10 +168,12 @@ def sample_channel(t, values, starts, ends, offset_s=0.0, kind="continuous", max
                 slope = (y[i + 1] - y[i]) / (t[i + 1] - t[i])
                 v0, v1 = float(y[i] + slope * (lo - t[i])), float(y[i] + slope * (hi - t[i]))
             covered += hi - lo
+            _append_interval_range(exposure["supported_interval_row_ranges"], i)
             area += (hi - lo) * (v0 + v1) / 2
             extrema.extend((v0, v1))
         duration = b - a
         coverage = min(1.0, max(0.0, float(covered / duration)))
+        exposure["supported_duration_s"] = float(covered)
         full = bool(extrema) and not flags and abs(covered - duration) <= 1e-12 * duration
         if not full:
             flags.append("incomplete_coverage")
@@ -142,7 +181,7 @@ def sample_channel(t, values, starts, ends, offset_s=0.0, kind="continuous", max
             flags.append("midpoint_unavailable")
         rows.append(dict(mid=mid, mean=float(area / duration) if full else None,
                          min=min(extrema) if full else None, max=max(extrema) if full else None,
-                         coverage=coverage, valid=full, flags=flags))
+                          coverage=coverage, valid=full, flags=flags, provenance=provenance))
     return rows
 
 
@@ -193,7 +232,15 @@ def _frame_clock_metadata(frames):
     return mids, starts, evidence
 
 
-def _onset(t, values, valid, baseline_n, min_run, k_sigma, direction):
+def _baseline_stats(values):
+    base = float(np.median(values))
+    noise = 1.4826 * float(np.median(np.abs(values - base)))
+    if noise == 0 and np.any(values != base):
+        noise = float(np.std(values))
+    return base, noise
+
+
+def _onset(t, values, valid, baseline_n, min_run, k_sigma, direction, max_gap_s=None, threshold_scale=1.):
     """Detect a sustained departure only after a demonstrably static prefix."""
     y = _series(t, values)
     valid = np.asarray(valid, dtype=bool)
@@ -222,15 +269,13 @@ def _onset(t, values, valid, baseline_n, min_run, k_sigma, direction):
         if monotonic or (abs(y[n - 1] - y[0]) > max(k_sigma * noise, floor)
                          and np.all(diffs * delta >= 0)):
             return None, "initially_changing"
-    base = float(np.median(y[:n]))
-    noise = 1.4826 * float(np.median(np.abs(y[:n] - base)))
     # Quantized records can have a zero MAD despite real baseline scatter.
-    if noise == 0 and np.any(y[:n] != base):
-        noise = float(np.std(y[:n]))
-    threshold = max(k_sigma * noise, floor)
+    base, noise = _baseline_stats(y[:n])
+    threshold = max(k_sigma * noise * threshold_scale, floor)
     signs = (1,) if direction == "rise" else (-1,) if direction == "fall" else (1, -1)
     candidates = []
-    max_gap = _gap_limit(t)
+    gap_candidate = False
+    max_gap = _gap_limit(t, max_gap_s)
     for sign in signs:
         run = 0
         for i in range(n, len(y)):
@@ -241,12 +286,49 @@ def _onset(t, values, valid, baseline_n, min_run, k_sigma, direction):
                     first = i - min_run + 1
                     if good[first - 1] and t[first] - t[first - 1] <= max_gap:
                         candidates.append((float(t[first]), float(t[first] - t[first - 1])))
+                    elif t[first] - t[first - 1] > max_gap:
+                        gap_candidate = True
                     break
             else:
                 run = 0
     if not candidates:
-        return None, "event_missing"
+        return None, "event_crosses_gap" if gap_candidate else "event_missing"
     return min(candidates), "event_found"
+
+
+def _event_measurement(t, values, valid, baseline_n, min_run, k_sigma, direction, max_gap_s=None):
+    """Keep a sampled threshold crossing separate from its timing sensitivity.
+
+    A k-sigma departure is not the physical ramp onset. The threshold divided
+    by the observed crossing slope estimates how much its time can move because
+    of baseline scatter. A second crossing at half the threshold checks that a
+    single steep sample does not hide this sensitivity. These are diagnostics,
+    not fitted latency corrections or statistical confidence intervals. A sharp
+    step stays bracketed by its adjacent samples; a slow noisy ramp must remain
+    an unconfirmed candidate.
+    """
+    onset, cause = _onset(t, values, valid, baseline_n, min_run, k_sigma, direction, max_gap_s)
+    if onset is None:
+        return None, cause
+    y = _series(t, values)
+    index = int(np.searchsorted(t, onset[0]))
+    base, noise = _baseline_stats(y[:baseline_n])
+    slope = abs(float(y[index] - y[index - 1])) / onset[1]
+    slope_timing = k_sigma * noise / slope if slope > 0 else 0.
+    lower, lower_cause = _onset(t, y, valid, baseline_n, min_run, k_sigma, direction, max_gap_s, .5)
+    sensitivity = abs(onset[0] - lower[0]) if lower is not None else None
+    threshold_timing = max(slope_timing, sensitivity or 0.)
+    return dict(onset_s=onset[0], row_index=index,
+                bracket_s=[float(t[index - 1]), float(t[index])], sampling_interval_s=onset[1],
+                baseline_level=base, baseline_noise=noise, k_sigma=k_sigma,
+                noise_threshold=k_sigma * noise, crossing_slope_abs=slope,
+                threshold_slope_timing_s=slope_timing, threshold_sensitivity_s=sensitivity,
+                comparison_threshold_scale=.5,
+                comparison_onset_s=lower[0] if lower is not None else None,
+                comparison_status=lower_cause,
+                threshold_timing_s=threshold_timing,
+                threshold_timing_ambiguous=lower is None or threshold_timing > onset[1] * (1 + 1e-12),
+                max_gap_s=float(_gap_limit(t, max_gap_s))), cause
 
 
 def resolve_clock(frames, source, features=None, experiment="generic"):
@@ -286,6 +368,12 @@ def resolve_clock(frames, source, features=None, experiment="generic"):
             max(spread, interval) if interval is not None else None)
         evidence.update(anchor_offsets_s=offsets, tolerance_s=tolerance,
                         anchor_residuals_s=[o - dt for o in offsets], anchor_max_residual_s=spread,
+                        anchor_frame_range_s=[min(float(p["frame_time_s"]) for p in pairs),
+                                              max(float(p["frame_time_s"]) for p in pairs)],
+                        anchor_source_range_s=[min(float(p["source_time_s"]) for p in pairs),
+                                               max(float(p["source_time_s"]) for p in pairs)],
+                        mapping_model="constant_offset",
+                        anchor_range_definition="observation span; fixed-offset validity outside this span is not measured",
                         uncertainty_basis="declared" if declared is not None else (
                             "frame_interval" if interval is not None else "unavailable"))
         if spread > tolerance + 1e-12:
@@ -315,30 +403,37 @@ def resolve_clock(frames, source, features=None, experiment="generic"):
     direction = config.get("direction")
     if baseline_n < 2 or min_run < 1 or k_sigma <= 0 or direction not in {None, "rise", "fall"}:
         raise InputError("Invalid event detection settings", "invalid_event")
-    external, cause = _onset(t, channel["values"], np.isfinite(_series(t, channel["values"])),
-                             baseline_n, min_run, k_sigma, direction)
+    external, cause = _event_measurement(t, channel["values"], np.isfinite(_series(t, channel["values"])),
+                                        baseline_n, min_run, k_sigma, direction, channel.get("max_gap_s"))
     if external is None:
         return _decision(method, "source_" + cause, evidence=evidence)
-    evidence["source_onset_s"] = external[0]
-    candidates, uncertainties, failures, signal_events = [], [], [], []
+    evidence.update(source_onset_s=external["onset_s"], source_event=external)
+    candidates, uncertainties, sampling_widths, failures, signal_events = [], [], [], [], []
+    threshold_ambiguous = external["threshold_timing_ambiguous"]
     for signal in (features or {}).get("signals", []):
         signal_t = _clock(signal.get("t_s", []), "features.t_s")
         valid = signal.get("valid", [True] * len(signal_t))
-        onset, cause = _onset(signal_t, signal.get("values", []), valid, baseline_n, min_run, k_sigma, None)
+        onset, cause = _event_measurement(signal_t, signal.get("values", []), valid,
+                                         baseline_n, min_run, k_sigma, None, signal.get("max_gap_s"))
         if onset is None:
             failures.append({"id": signal.get("id"), "reason": cause})
             continue
-        candidate = external[0] - onset[0]
+        candidate = external["onset_s"] - onset["onset_s"]
         candidates.append(candidate)
-        uncertainties.append(external[1] + onset[1])
-        signal_events.append(dict(id=signal.get("id"), onset_s=onset[0], candidate_dt_s=candidate))
+        sampling = external["sampling_interval_s"] + onset["sampling_interval_s"]
+        sampling_widths.append(sampling)
+        uncertainties.append(sampling + external["threshold_timing_s"] + onset["threshold_timing_s"])
+        threshold_ambiguous |= onset["threshold_timing_ambiguous"]
+        signal_events.append(dict(id=signal.get("id"), candidate_dt_s=candidate, **onset))
     evidence.update(signal_events=signal_events, unavailable_signals=failures)
     if not candidates:
         return _decision(method, "feature_event_missing_or_baseline_unavailable", evidence=evidence)
     candidate = float(np.median(candidates))
     uncertainty = float(max(uncertainties))
-    evidence["sampling_uncertainty_s"] = uncertainty
-    evidence["sparse_sampling"] = interval is None or uncertainty > interval
+    evidence["sampling_uncertainty_s"] = float(max(sampling_widths))
+    evidence["uncertainty_basis"] = "sample_brackets_plus_noise_threshold_timing_sensitivity"
+    evidence["uncertainty_interpretation"] = "sampling and threshold sensitivity estimate; not a statistical confidence interval"
+    evidence["sparse_sampling"] = interval is None or max(sampling_widths) > interval
     if interval is None:
         return _decision(method, "frame_interval_unavailable", candidate=candidate, uncertainty=uncertainty, evidence=evidence)
     if max(candidates) - min(candidates) > interval + 1e-12:
@@ -355,6 +450,9 @@ def resolve_clock(frames, source, features=None, experiment="generic"):
     if latency_keys:
         return _decision(method, "physical_response_latency_is_not_clock_evidence", candidate=candidate,
                          uncertainty=uncertainty, evidence=evidence)
+    if threshold_ambiguous:
+        return _decision(method, "event_threshold_timing_ambiguous", candidate=candidate,
+                         uncertainty=uncertainty, evidence=evidence)
     common_load = experiment == "tensile" and str(channel_name).lower() in {"force", "load", "stress", "strain"}
     if not common_load and config.get("confirmed_same_event") is not True:
         return _decision(method, "same_event_confirmation_required", candidate=candidate,
@@ -363,19 +461,19 @@ def resolve_clock(frames, source, features=None, experiment="generic"):
                      uncertainty=uncertainty, evidence=evidence)
 
 
-def label_phases(t, values, query, experiment="generic", kind="continuous", tolerance=None, max_gap_s=None):
-    """Label local chronological phases without merging repeated cycles."""
+def _phase_context(t, values, experiment, kind, tolerance, max_gap_s):
     t = _clock(t)
     y = _series(t, values)
     _kind(kind)
-    query = _array(query, "query")
     gap = _gap_limit(t, max_gap_s)
     dt, dy = np.diff(t), np.diff(y)
     supported = np.isfinite(y[:-1]) & np.isfinite(y[1:]) & (dt <= gap)
     slopes = np.divide(dy, dt)
+    # A numerical rounding threshold must scale with differences, not with the
+    # unit's numerical size or its zero (e.g. metres/nanometres, Celsius/Kelvin).
+    slope_scale = float(np.max(np.abs(slopes[supported]))) if supported.any() else 0.
+    rounding = 8 * np.finfo(float).eps * slope_scale
     if tolerance is None:
-        finite = y[np.isfinite(y)]
-        scale = max(float(np.ptp(finite)), float(np.max(np.abs(finite))), 1.0) if len(finite) else 1.0
         # Constant ramps have constant slopes. Their successive differences
         # estimate noise without treating ramp magnitude as measurement scatter.
         # Use only adjacent supported intervals, never differences across gaps.
@@ -389,7 +487,7 @@ def label_phases(t, values, query, experiment="generic", kind="continuous", tole
             # 0.318639 is the 25th percentile of an absolute standard normal.
             lower = float(np.quantile(np.abs(differences), 0.25)) / 0.31863936396437514
             noise = min(mad, lower) / np.sqrt(2)
-        threshold = max(scale * 1e-9, 4 * noise)
+        threshold = max(rounding, 4 * noise)
     else:
         threshold = _finite(tolerance, "tolerance")
         if threshold < 0:
@@ -398,6 +496,15 @@ def label_phases(t, values, query, experiment="generic", kind="continuous", tole
     first_change = int(np.flatnonzero(changed)[0]) if changed.any() else None
     up, down = {"thermal": ("heating", "cooling"), "tensile": ("loading", "unloading")}.get(
         experiment, ("increasing", "decreasing"))
+    return dict(t=t, y=y, kind=kind, gap=gap, dt=dt, slopes=slopes, supported=supported,
+                changed=changed, first_change=first_change, threshold=threshold, up=up, down=down,
+                rounding=rounding, tolerance_source="estimated_noise" if tolerance is None else "declared")
+
+
+def _phase_labels(context, query):
+    t, y, kind, gap = (context[k] for k in ("t", "y", "kind", "gap"))
+    dt, slopes, supported, changed = (context[k] for k in ("dt", "slopes", "supported", "changed"))
+    first_change, threshold, up, down = (context[k] for k in ("first_change", "threshold", "up", "down"))
     result = []
     for q in query:
         if not np.isfinite(q) or _point(t, y, q, kind, gap) is None:
@@ -425,4 +532,66 @@ def label_phases(t, values, query, experiment="generic", kind="continuous", tole
             result.append(down)
         else:
             result.append("hold")
+    return result
+
+
+def label_phases(t, values, query, experiment="generic", kind="continuous", tolerance=None, max_gap_s=None):
+    """Label local chronological phases without merging repeated cycles.
+
+    An explicit tolerance has units of channel units/second. Otherwise the
+    threshold estimates slope noise; it is not an instrument resolution claim.
+    """
+    return _phase_labels(_phase_context(t, values, experiment, kind, tolerance, max_gap_s),
+                         _array(query, "query"))
+
+
+def exposure_phases(t, values, starts, ends, offset_s=0.0, experiment="generic",
+                    kind="continuous", tolerance=None, max_gap_s=None):
+    """Describe midpoint phase and chronological phases within each exposure.
+
+    The positive-duration exposure is [start, end): a step exactly at its right
+    boundary does not change its exposure statistics. Unknown portions remain
+    explicit and never count as evidence of a physical phase transition.
+    """
+    context = _phase_context(t, values, experiment, kind, tolerance, max_gap_s)
+    t = context["t"]
+    starts, ends = _array(starts, "starts"), _array(ends, "ends")
+    if len(starts) != len(ends):
+        raise InputError("Exposure lengths differ", "length_mismatch")
+    if not np.isfinite(starts).all() or not np.isfinite(ends).all() or np.any(ends < starts):
+        raise InputError("Exposure bounds must be finite with end >= start", "invalid_exposure")
+    offset = _finite(offset_s, "offset_s")
+    with np.errstate(over="ignore"):
+        shifted_starts, shifted_ends = starts + offset, ends + offset
+    if not np.isfinite(shifted_starts).all() or not np.isfinite(shifted_ends).all():
+        raise InputError("Shifted exposure bounds must be finite", "invalid_exposure")
+    result = []
+    for a, b in zip(shifted_starts, shifted_ends):
+        midpoint = _phase_labels(context, [a + (b - a) / 2])[0]
+        queries = []
+        if a == b:
+            queries.append(a)
+        else:
+            if a < t[0]:
+                queries.append(a + (min(b, t[0]) - a) / 2)
+            first = max(0, int(np.searchsorted(t, a, side="right")) - 1)
+            last = min(len(t) - 1, int(np.searchsorted(t, b, side="left")))
+            for i in range(first, last):
+                lo, hi = max(a, t[i]), min(b, t[i + 1])
+                if hi > lo:
+                    queries.append(lo + (hi - lo) / 2)
+            if kind == "step":
+                queries.extend(t[np.searchsorted(t, a):np.searchsorted(t, b)])
+            if b > t[-1]:
+                queries.append(max(a, t[-1]) + (b - max(a, t[-1])) / 2)
+        phases = []
+        for phase in _phase_labels(context, sorted(queries)):
+            if not phases or phases[-1] != phase:
+                phases.append(phase)
+        if not phases:
+            phases = ["unknown"]
+        known = set(phases) - {"unknown"}
+        result.append(dict(midpoint=midpoint, phases=phases, crosses_phase=len(known) > 1,
+                           unsupported="unknown" in phases, tolerance_slope=context["threshold"],
+                           tolerance_source=context["tolerance_source"], roundoff_slope=context["rounding"]))
     return result

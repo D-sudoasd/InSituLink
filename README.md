@@ -34,15 +34,25 @@ py -3 -m insitulink demo --case multi --output output/demo-multi
 
 ## 处理自己的数据
 
-按 [请求文件说明](docs/REQUEST.md) 建立 `experiment.json`：
+先从实际文件生成请求草稿和待补字段清单：
 
 ```powershell
-py -3 -m insitulink run --request D:/experiment/experiment.json --output D:/experiment/results
+py -3 -m insitulink prepare --frames D:/experiment/frames.csv --source mechanics=D:/experiment/load.csv --output D:/experiment/setup
+```
+
+`prepare` 读取列名与元数据，生成 `experiment.json`、可复用的 `profile.json`、导入预览和具体待办。多个设备重复使用 `--source ID=PATH`；已有设备配置可用 `--profile PATH`。未声明的物理单位、时间语义和同步依据仍需补齐，不会自动确认零偏移。原文件保持不变；输出目录必须是新目录。
+
+按 [请求文件说明](docs/REQUEST.md) 补齐草稿，也可继续使用自己编写的版本 1 请求：
+
+```powershell
+py -3 -m insitulink run --request D:/experiment/setup/experiment.json --output D:/experiment/results
 py -3 -m insitulink inspect --output D:/experiment/results
 py -3 -m insitulink resume --output D:/experiment/results
 ```
 
 程序不修改原始输入。输出为机器可读 JSON，退出码为 `0` 完成、`2` 需要输入或确认、`1` 运行或交付失败；成功读取运行中快照的 inspect 也返回 0。`resume` 重新验证当前输入，复用仍然有效的阶段。离线打开结果目录中的 `report.html` 查看曲线和判断依据。
+
+报告可搜索和筛选逐帧记录，查看原始位置、曝光区间、外部参数来源及无效原因。页首分别显示对齐结果和原始数据就绪情况；日志缺口保留断线，阶梯量按保持规则绘制。帧身份与本次处理记录见 [逐帧身份与追溯](docs/FRAME_IDENTITY.md)。
 
 Agent 使用方式见 [AGENTS.md](AGENTS.md)。确定性计算在本地完成，包内没有大模型调用或网络服务。
 
@@ -55,11 +65,13 @@ Agent 使用方式见 [AGENTS.md](AGENTS.md)。确定性计算在本地完成，
 | 时间关系 | 已确认的偏移或共同计时、人工或触发时间锚点、按需衍射事件候选 |
 | 衍射预分析 | 已有一维谱；或具有明确 PONI 几何、波长、掩膜和校正设置的二维帧一维积分 |
 | 参数统计 | 曝光中点值、时间加权均值、最小值、最大值、覆盖率和有效性 |
-| 交付 | 逐帧 CSV、峰拟合结果、帧清单、偏移依据、DIDASFlow 交接 JSON、离线 HTML 报告 |
+| 交付 | 逐帧 CSV、身份与参数来源记录、峰拟合结果、帧清单、偏移依据、DIDASFlow 交接 JSON、离线可筛选报告 |
 
 固定偏移约定为 `外部记录时间 = 探测器时间 + Δt`。独立设备分别对齐，只有确认共用计时和起点的通道才共享偏移。
 
 实际帧时间优先；通过采集周期重建时间需要显式确认。未解决的偏移为 `null`，不是默认零。程序不拉伸时间轴、不在记录范围外外推、不跨越长日志缺口插值。基线帧保留；加载、卸载、升温、降温和保持按时间顺序标注。
+
+内部计算将精确时间起点与相对秒分开保存，避免短曝光在 UTC 浮点秒中丢失。设备重启或不一致锚点需要分段证据，不能按曲线吻合自动修正漂移。事件估计同时检查缺口和越阈时刻对信号噪声的敏感性。
 
 仅靠温度与峰位变化不能区分设备起点偏移和实际热响应延迟，此类结果保留为候选。峰拟合不自动给出物相或 hkl；拟合不确定度不包含标定误差。
 

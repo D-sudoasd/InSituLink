@@ -65,20 +65,41 @@ class FileDigests:
 
     def __init__(self):
         self.values = {}
+        self.snapshots = {}
 
-    def file(self, path):
+    @staticmethod
+    def _signature(stat):
+        return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+
+    def capture(self, path):
+        """Return immutable table/request bytes and the digest of those exact bytes."""
+        path = Path(path).resolve()
+        try:
+            before = self._signature(path.stat())
+            key = (str(path), before)
+            if key not in self.snapshots:
+                data = path.read_bytes()
+                if before != self._signature(path.stat()):
+                    raise InputError(f"Input changed while being read: {path}", "input_changed")
+                self.snapshots[key] = data
+                self.values[key] = hashlib.sha256(data).hexdigest()
+            return self.snapshots[key], {"path": str(path), "sha256": self.values[key]}
+        except OSError as exc:
+            raise InputError(f"Cannot read input {path}: {exc}", "unreadable_input") from exc
+
+    def file(self, path, *, force=False):
         path = Path(path).resolve()
         try:
             before = path.stat()
-            signature = (before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_ino)
+            signature = self._signature(before)
             key = (str(path), signature)
-            if key not in self.values:
+            if force or key not in self.values:
                 checksum = hashlib.sha256()
                 with path.open("rb") as stream:
                     for block in iter(lambda: stream.read(1024 * 1024), b""):
                         checksum.update(block)
                 after = path.stat()
-                if signature != (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_ino):
+                if signature != self._signature(after):
                     raise InputError(f"Input changed while being read: {path}", "input_changed")
                 self.values[key] = checksum.hexdigest()
             return {"path": str(path), "sha256": self.values[key]}
