@@ -42,6 +42,8 @@ On HEPS ID07 the count time is 1.0 s. Realized start-to-start intervals are abou
 
 Rejected candidate lags are stored as `rejected_dt_s`. The published `dt_s` is 0.
 
+Legacy `strainlink` publishes numeric `dt_s` 0 with `onset_unresolved` true. That 0 means unresolved, not a measured zero. The rejected lag stays in `rejected_dt_s`. `align_scan` adds that number to the exposure midpoint, including for `python -m strainlink align --demo heps_id07_eiger`. Do not change this legacy 0 into null, do not retarget `heps_id07_eiger`, and do not add an IRAY reader. `insitulink` `resolve_clock` leaves an unresolved `dt_s` null and puts an unconfirmed lag in `candidate_dt_s`. Do not copy either sentinel into the other package. A confirmed shared clock or a coincident onset in `insitulink` may still publish a real 0 with status resolved. The README statement that an unresolved offset is null applies only to `insitulink`.
+
 ## Flags an agent must read
 
 | Flag | What it means | What the pipeline does not do |

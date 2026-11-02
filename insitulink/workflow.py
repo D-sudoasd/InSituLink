@@ -121,6 +121,7 @@ def _select(frames, analysis):
 
 
 def _table(frames, sources, decisions, issues, experiment):
+    from .strain_reliability import strain_reliability, stress_identity
     from .time_coordinates import clock_offset_local_s
 
     calculation_frames = local_frames(frames)
@@ -193,6 +194,53 @@ def _table(frames, sources, decisions, issues, experiment):
                 row[f"{prefix}.phase_exposure"] = phase
                 if channel["required"] and not values["valid"]:
                     row["valid_analysis"] = False
+                is_stress = channel.get("role") == "stress" or name == "stress"
+                is_strain = name != "eps_hkl" and (channel.get("role") == "strain" or name == "strain")
+                if is_stress or is_strain:
+                    sample_flags = row[f"{prefix}.flags"]
+                    provenance = row.get(f"{prefix}.provenance")
+                    midpoint = provenance.get("midpoint") if isinstance(provenance, dict) else None
+                    point_status = midpoint.get("status") if isinstance(midpoint, dict) else None
+                    if ("before_record" in sample_flags or "after_record" in sample_flags
+                            or (row[f"{prefix}.mid"] is None and point_status == "outside_record")):
+                        published_flags = list(sample_flags)
+                        if "outside_record" not in published_flags:
+                            published_flags.append("outside_record")
+                        row[f"{prefix}.flags"] = published_flags
+                        for statistic in ("mid", "mean", "min", "max"):
+                            row[f"{prefix}.{statistic}"] = None
+        reliability = strain_reliability(source["channels"])
+        strain_names = [channel_name for channel_name, channel in source["channels"].items()
+                        if channel_name != "eps_hkl" and (channel.get("role") == "strain" or channel_name == "strain")]
+        if strain_names:
+            returned_flags = list(reliability["flags"])
+            for strain_name in strain_names:
+                strain_prefix = f"{source['id']}.{strain_name}"
+                for row in table:
+                    row_flags = list(row[f"{strain_prefix}.flags"])
+                    for flag in returned_flags:
+                        if flag not in row_flags:
+                            row_flags.append(flag)
+                    row[f"{strain_prefix}.flags"] = row_flags
+                    row[f"{strain_prefix}.provenance"]["strain_reliability"] = {
+                        "flags": list(returned_flags), "evaluated": reliability["evaluated"]}
+        if "force" in source["channels"] and "area" in source["channels"] and "stress" in source["channels"]:
+            identity = stress_identity(source["channels"]["stress"]["values"], source["channels"]["force"]["values"],
+                                      source["channels"]["area"]["values"])
+            if identity == "stress_identity_unresolved":
+                issues.append({"code": identity, "source_id": source["id"],
+                               "message": "Stress is inconsistent with force and area."})
+                stress_required = source["channels"]["stress"].get("required", True)
+                for row in table:
+                    for statistic in ("mid", "mean", "min", "max"):
+                        row[f"{source['id']}.stress.{statistic}"] = None
+                    row[f"{source['id']}.stress.valid"] = False
+                    identity_flags = list(row[f"{source['id']}.stress.flags"])
+                    if identity not in identity_flags:
+                        identity_flags.append(identity)
+                    row[f"{source['id']}.stress.flags"] = identity_flags
+                    if stress_required:
+                        row["valid_analysis"] = False
     if not required_seen:
         issues.append({"code": "no_required_channels", "message": "All channels are optional; valid_analysis covers frame selection only."})
     return table
@@ -283,6 +331,8 @@ def _run_locked(request_path, output, prepared):
         ids = [_id(source.get("id")) for source in request["sources"]]
         if len(set(ids)) != len(ids):
             raise InputError("External device identifiers must be unique")
+        if prepared.get("archived_scan") is True or request["frames"].get("archived") is True:
+            raise InputError("Archived scan is named in the request and is not analyzed", "archived_scan_skipped")
         frames, metadata = _frames(request["frames"], base, stages, files)
         if not frames:
             raise InputError("No physical frames found", "missing_frames")
@@ -308,7 +358,7 @@ def _run_locked(request_path, output, prepared):
                 state["issues"].append({"source_id": config["id"], **exc.as_dict()})
         calculation_frames = local_frames(frames)
         features = _inline_features(calculation_frames)
-        needs_features = any((s["clock"].get("method") == "event" or s["clock"].get("event")) for s in sources)
+        needs_features = any((s["clock"].get("method") in {"event", "scan_span"} or s["clock"].get("event")) for s in sources)
         if needs_features and request.get("features") and not features["signals"]:
             try:
                 from .preview import extract_features
@@ -339,8 +389,12 @@ def _run_locked(request_path, output, prepared):
                                       lambda source=source: resolve_source_clock(frames, source, features, experiment, metadata),
                                       ["numerics.py", "time_coordinates.py", "workflow_inputs.py"])
             except InputError as exc:
+                # InputError path stays dt_s=None.
                 decision = {"status": "needs_input", "method": source["clock"].get("method"), "dt_s": None, "candidate_dt_s": None,
                             "reason": str(exc), "evidence": exc.as_dict()}
+            else:
+                from .workflow_inputs import apply_continuation
+                decision = apply_continuation(decision, source, frames)
             state["decisions"][source["id"]] = decision
             if decision["status"] != "resolved":
                 state["issues"].append({"code": "clock_unresolved", "source_id": source["id"], "message": decision["reason"]})

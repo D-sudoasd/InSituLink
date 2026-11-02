@@ -287,6 +287,9 @@ def resolve_event_dt(
     t_mid = _as_float_array(t_mid)
     eps = _as_float_array(eps)
     t_force = _as_float_array(t_force)
+    # Legacy sentinel: unresolved publishes dt_s=0.0 with onset_unresolved=True.
+    # Do not change 0.0 to None. A rejected lag stays in rejected_dt_s.
+    # None breaks float(dt_s) in align_scan and the heps_id07_eiger JSON demo.
     result = {
         "dt_s": 0.0,
         "onset_frame": 0,

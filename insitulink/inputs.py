@@ -298,6 +298,38 @@ def _period(config):
     return exposure, interval, start
 
 
+def _scan_span(config):
+    """Confirmed start/end span. Nominal period and delay are not a clock."""
+    span = config.get("scan_span")
+    if not isinstance(span, dict):
+        return None
+    if span.get("confirmed") is not True:
+        return None
+    required = ("start_s", "end_s", "exposure_s")
+    if any(_missing(span.get(name)) for name in required):
+        raise InputError("Confirmed scan_span requires start_s, end_s, and exposure_s",
+                         code="scan_span_fields_missing")
+    start = decimal_time(span.get("start_s"), "scan_span.start_s")
+    end = decimal_time(span.get("end_s"), "scan_span.end_s")
+    exposure = decimal_time(span.get("exposure_s"), "scan_span.exposure_s")
+    declared_n = None
+    if not _missing(span.get("n")):
+        declared = decimal_time(span.get("n"), "scan_span.n")
+        integral = declared.to_integral_value()
+        if declared != integral or int(integral) < 2:
+            raise InputError("Confirmed scan_span requires integer n >= 2 when n is declared",
+                             code="scan_span_invalid")
+        declared_n = int(integral)
+    if end <= start or exposure < 0:
+        raise InputError("Confirmed scan_span requires end_s > start_s and exposure_s >= 0",
+                         code="scan_span_invalid")
+    nominal_period = None
+    if not _missing(span.get("nominal_period_s")):
+        nominal_period = decimal_time(span.get("nominal_period_s"), "scan_span.nominal_period_s")
+    return {"start": start, "end": end, "exposure": exposure, "n": declared_n,
+            "nominal_period": nominal_period}
+
+
 def _optional_decimal(value, label):
     if _missing(value):
         return None
@@ -328,10 +360,28 @@ def _frame_rows(records, config, base_dir, origin, *, starts=None, exposures=Non
                                "unit_source": "request.exposure_unit" if "exposure_unit" in config else
                                "time.unit" if columns["exposure"] != "exposure_s" else "default_seconds",
                                "scaling_factor": "1"}
+    # Scan span is only a fallback for a completely missing clock. It must not stretch measured times.
+    scan = _scan_span(config)
     period = _period(config)
-    if not any(value is not None for value in starts) and period is None:
+    if scan is not None and (period is not None or any(value is not None for value in starts)):
+        raise InputError("Confirmed scan_span cannot replace measured frame times or a confirmed constant_period",
+                         code="scan_span_conflicts_with_measured_times")
+    if scan is not None and scan["n"] is not None and scan["n"] != len(records):
+        raise InputError("Confirmed scan_span n does not match the frame count",
+                         code="scan_span_count_mismatch", declared_n=scan["n"], frame_count=len(records))
+    if scan is not None and len(records) < 2:
+        raise InputError("Confirmed scan_span requires at least two frames", code="scan_span_invalid")
+    if not any(value is not None for value in starts) and period is None and scan is None:
         raise InputError("Frame timestamps are required; reconstruction requires constant_period.confirmed=true", code="missing_frame_times")
     result, reconstructed, exact_starts, exact_exposures = [], [], [], []
+    scan_step = None
+    nominal_disagrees = None
+    if scan is not None:
+        with localcontext() as context:
+            context.prec = 50
+            scan_step = (scan["end"] - scan["start"]) / Decimal(len(records) - 1)
+            if scan["nominal_period"] is not None:
+                nominal_disagrees = abs(scan["nominal_period"] - scan_step) > Decimal("1e-12")
     reconstruction_origin = (_iso_decimal(settings["start"], settings)
                              if settings.get("start") is not None else Decimal(0))
     start_field = (config.get("start_dataset", "/entry/instrument/detector/start_time")
@@ -353,14 +403,22 @@ def _frame_rows(records, config, base_dir, origin, *, starts=None, exposures=Non
             raise InputError(f"row {i} frame_index must be a nonnegative integer")
         index = int(index)
         was_reconstructed = start is None and period is not None
+        filled_by_scan_span = start is None and scan is not None and not was_reconstructed
         raw_time_missing = start is None
         if was_reconstructed:
             with localcontext() as context:
                 context.prec = 50
                 start = reconstruction_origin + period[2] + index * period[1]
             reconstructed.append(i)
+        elif filled_by_scan_span:
+            with localcontext() as context:
+                context.prec = 50
+                start = scan["start"] + Decimal(index) * scan_step
+            reconstructed.append(i)
         if exposure is None and period is not None:
             exposure = period[0]
+        elif exposure is None and filled_by_scan_span:
+            exposure = scan["exposure"]
         if exposure is not None and (not exposure.is_finite() or exposure < 0):
             raise InputError(f"row {i} exposure must be finite and nonnegative")
         dataset = row.get(columns["dataset"])
@@ -374,11 +432,19 @@ def _frame_rows(records, config, base_dir, origin, *, starts=None, exposures=Non
                     pass
         row_provenance = {**provenance, "raw_value": _raw_value(raw_starts[i]),
                           "source_row_number": row_numbers[i],
-                          "reconstructed": was_reconstructed,
+                          "reconstructed": was_reconstructed or filled_by_scan_span,
                           "exposure": {**(exposure_provenance or {}),
                                        "raw_value": _raw_value(raw_exposures[i]) if raw_exposures is not None else None}}
         if period is not None:
             row_provenance["constant_period"] = {key: _raw_value(value) for key, value in config["constant_period"].items()}
+        if filled_by_scan_span:
+            recorded = {key: _raw_value(value) for key, value in config["scan_span"].items()}
+            recorded["used_nominal_period_as_clock"] = False
+            row_provenance["used_nominal_period_as_clock"] = False
+            if scan["nominal_period"] is not None:
+                recorded["nominal_period_disagrees"] = bool(nominal_disagrees)
+                row_provenance["nominal_period_disagrees"] = bool(nominal_disagrees)
+            row_provenance["scan_span"] = recorded
         with localcontext() as context:
             context.prec = 50
             end = None if start is None or exposure is None else start + exposure
@@ -393,7 +459,8 @@ def _frame_rows(records, config, base_dir, origin, *, starts=None, exposures=Non
                     t_end_s=None if end is None else float(end),
                     t_mid_s=None if mid is None else float(mid),
                     source_row_number=row_numbers[i], time_provenance=row_provenance,
-                    clock_source="confirmed_constant_period" if was_reconstructed else origin,
+                    clock_source=("request_scan_span" if filled_by_scan_span else
+                                  "confirmed_constant_period" if was_reconstructed else origin),
                     time_missing=start is None, raw_time_missing=raw_time_missing)
         result.append(item)
         exact_starts.append(start)
