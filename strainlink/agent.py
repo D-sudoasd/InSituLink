@@ -134,6 +134,7 @@ def align_scan(frame_record: dict, tensile_record: dict, profile: str) -> dict[s
         load_abs_floor=config.load_abs_floor,
         load_status=load_status,
     )
+    # dt_s is always a float. An unresolved legacy onset is 0.0, not null.
     dt = float(resolved["dt_s"])
     t_mech = clock["t_mid_s"] + dt
     sampled = {}

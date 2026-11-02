@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from decimal import Decimal, localcontext
+import math
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 
 import numpy as np
@@ -47,13 +48,18 @@ def prepare_inputs(request_path, output):
     if not isinstance(request, dict):
         return prepared
     base = request_path.parent
-    configs = [request.get("frames")] + (request.get("sources") if isinstance(request.get("sources"), list) else [])
-    paths, selections = [], []
     frame_config = request.get("frames")
+    archived_frames = isinstance(frame_config, dict) and frame_config.get("archived") is True
+    if archived_frames:
+        # Do not open an archived frame path, including when that path is missing.
+        prepared["archived_scan"] = True
+    source_configs = request.get("sources") if isinstance(request.get("sources"), list) else []
+    configs = source_configs if archived_frames else [frame_config, *source_configs]
+    paths, selections = [], []
     for config in configs:
         if isinstance(config, dict) and config.get("path"):
             paths.append(input_path(config["path"], base))
-    if isinstance(frame_config, dict):
+    if isinstance(frame_config, dict) and not archived_frames:
         if frame_config.get("type", "table") == "hdf5" and frame_config.get("path"):
             source = str(input_path(frame_config["path"], base))
             # Include timing datasets too: external links may store metadata in
@@ -175,6 +181,189 @@ def public_decision(decision, source, frames):
     return result
 
 
+_CONTINUATION_REASONS = frozenset({
+    "onset_at_first_frame", "initially_changing", "baseline_missing",
+    "onset_missing", "elastic_shape_weak", "event_missing",
+})
+
+
+def _finite_scalar(value):
+    """Return a finite float, or None. Booleans and non-scalars do not count."""
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, np.ndarray):
+        if value.shape != ():
+            return None
+        try:
+            value = value.item()
+        except ValueError:
+            return None
+        if isinstance(value, (bool, np.bool_)):
+            return None
+    if isinstance(value, (list, tuple, dict, set, bytes, bytearray)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _same_origin(left, right):
+    if left == right:
+        return True
+    try:
+        return Decimal(str(left)) == Decimal(str(right))
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
+def _event_channel_name(source, clock):
+    for holder in (clock.get("event"), source.get("event")):
+        if isinstance(holder, dict):
+            name = holder.get("channel")
+            if isinstance(name, str) and name:
+                return name
+    if clock.get("method") == "event":
+        name = clock.get("channel")
+        if isinstance(name, str) and name:
+            return name
+    return "force"
+
+
+def _channel_record(source, name):
+    channels = source.get("channels")
+    if isinstance(channels, dict):
+        return channels.get(name)
+    if isinstance(channels, list):
+        for item in channels:
+            if isinstance(item, dict) and item.get("name") == name:
+                return item
+    return None
+
+
+def _channel_values(channel):
+    if isinstance(channel, dict):
+        return channel.get("values")
+    if isinstance(channel, (list, tuple, np.ndarray)):
+        return channel
+    return None
+
+
+def _declared_preload(source, clock, parent, channel):
+    """First explicit preload. Do not estimate one from the force trace."""
+    holders = [parent, clock]
+    for holder in (clock.get("event"), source.get("event")):
+        if isinstance(holder, dict):
+            holders.append(holder)
+    if isinstance(channel, dict):
+        holders.append(channel)
+    holders.append(source)
+    for holder in holders:
+        if isinstance(holder, dict) and "preload" in holder:
+            return holder["preload"]
+    return None
+
+
+def _join_force(source, values):
+    """Force at the first local time >= 0. Samples before the record are not used."""
+    if values is None:
+        return None
+    times = source["t_rel_s"] if "t_rel_s" in source else source.get("t_s")
+    if times is None:
+        return None
+    try:
+        t = np.asarray(times, dtype=float)
+        y = np.asarray(values, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if t.ndim != 1 or y.ndim != 1 or t.shape != y.shape or t.size == 0:
+        return None
+    eligible = np.flatnonzero(np.isfinite(t) & (t >= 0))
+    if eligible.size == 0:
+        return None
+    index = int(eligible[int(np.argmin(t[eligible]))])
+    sample = float(y[index])
+    if not math.isfinite(sample):
+        return None
+    return sample
+
+
+def apply_continuation(decision, source, frames):
+    """Inherit a published parent wall span when this child record joins above preload.
+
+    The offset is ``parent_local_dt_s + (child_wall_start_s - parent_wall_start_s)``.
+    That wall-clock difference is the only gap term. Filenames and frame indices are not used.
+    A rejected continuation is not written into ``candidate_dt_s``.
+    """
+    if not isinstance(decision, dict) or not isinstance(source, dict):
+        return decision
+    clock = source.get("clock")
+    if not isinstance(clock, dict) or "continuation_of" not in clock:
+        return decision
+    continuation_of = clock.get("continuation_of")
+    if not isinstance(continuation_of, str) or continuation_of == "":
+        return decision
+    parent = clock.get("parent_wall_span")
+    if not isinstance(parent, dict) or parent.get("source_id") != continuation_of:
+        return decision
+    if decision.get("status") == "resolved":
+        return decision
+    reason = decision.get("reason")
+    if not isinstance(reason, str):
+        return decision
+    bare = reason[len("source_"):] if reason.startswith("source_") else reason
+    if bare not in _CONTINUATION_REASONS:
+        return decision
+    if parent.get("archived") is True:
+        return decision
+    if "uncertainty_s" not in parent:
+        return decision
+    parent_dt = _finite_scalar(parent.get("local_dt_s"))
+    parent_uncertainty = _finite_scalar(parent.get("uncertainty_s"))
+    parent_wall = _finite_scalar(parent.get("wall_start_s"))
+    child_wall = _finite_scalar(clock.get("wall_start_s"))
+    if None in (parent_dt, parent_uncertainty, parent_wall, child_wall):
+        return decision
+    channel_name = _event_channel_name(source, clock)
+    channel = _channel_record(source, channel_name)
+    preload = _finite_scalar(_declared_preload(source, clock, parent, channel))
+    if preload is None:
+        return decision
+    join = _join_force(source, _channel_values(channel))
+    if join is None or not join > preload:
+        return decision
+    existing = decision.get("evidence")
+    if existing is not None and not isinstance(existing, dict):
+        return decision
+    # The wall-clock difference is the only gap; do not add a second gap term.
+    local_dt = parent_dt + (child_wall - parent_wall)
+    origin = frame_origin(frames) if isinstance(frames, (list, tuple)) else "0"
+    external = source.get("time_origin_s", "0")
+    if _same_origin(origin, external):
+        dt_s = local_dt
+        dt_decimal = str(local_dt)
+    else:
+        from .time_coordinates import clock_offset_public_s
+
+        dt_s = clock_offset_public_s(local_dt, origin, external)
+        with localcontext() as context:
+            context.prec = 50
+            dt_decimal = str(Decimal(str(local_dt)) - Decimal(str(origin)) + Decimal(str(external)))
+    result = dict(decision)
+    result.update(status="resolved", method="continuation", reason="continuation_of_published_wall_span",
+                  dt_s=dt_s, local_dt_s=local_dt, dt_s_decimal=dt_decimal,
+                  uncertainty_s=parent_uncertainty + 1.0)
+    evidence = dict(existing or {})
+    evidence.update(continuation_of=continuation_of, child_reason=reason, parent_dt_s=parent_dt,
+                    parent_wall_start_s=parent_wall, child_wall_start_s=child_wall,
+                    join_force=join, preload=preload, filename_used=False, frame_indices_merged=False)
+    result["evidence"] = evidence
+    return result
+
+
 def resolve_source_clock(frames, source, features=None, experiment="generic", frame_metadata=None):
     """One shared clock-validation and coordinate path for prepare and execution."""
     from .numerics import resolve_clock
@@ -183,4 +372,4 @@ def resolve_source_clock(frames, source, features=None, experiment="generic", fr
             and source.get("metadata", {}).get("time_basis") != frame_metadata.get("time_basis")):
         raise InputError("Shared clocks need compatible time bases and origins; one record is absolute and the other relative", "incompatible_time_basis")
     decision = resolve_clock(local_frames(frames), local_source(source, frames), features, experiment)
-    return public_decision(decision, source, frames)
+    return apply_continuation(public_decision(decision, source, frames), source, frames)

@@ -108,7 +108,7 @@ HDF5 身份检查解析别名及外链，并对支持的 VDS 保留逻辑索引�
 - `required` 默认为 `true`，完整曝光覆盖参与 `valid_analysis`；可选通道保留独立有效性。
 - `phase_tolerance` 的单位是通道单位/秒；通道可用 `experiment` 覆盖主实验类型，例如热机械耦合记录中的温度和载荷。
 
-时间关系约定为 `外部时间 = 探测器时间 + Δt`。四种方法：
+时间关系约定为 `外部时间 = 探测器时间 + Δt`。五种方法：
 
 决策保留原数值 `dt_s/candidate_dt_s`，并附 `dt_s_decimal/candidate_dt_s_decimal` 保存精确十进制表达。`local_dt_s/local_candidate_dt_s` 对应两设备各自相对起点下的计算坐标。实际采样使用局部偏移，不能把大数值公共浮点偏移再换算回来而丢失小数部分。
 
@@ -130,6 +130,28 @@ HDF5 身份检查解析别名及外链，并对支持的 VDS 保留逻辑索引�
 ```json
 {"method": "event", "channel": "force", "baseline_samples": 8, "min_run": 3, "k_sigma": 4}
 ```
+
+```json
+{"method":"scan_span","start_s":0,"end_s":185,"exposure_s":0.3,"n":160,"nominal_period_s":1,"nominal_delay_s":0.7,"channel":"force"}
+```
+
+帧中点为 start_s + i*(end_s-start_s)/(n-1) + exposure_s/2。nominal_period_s 只比较，不作为时钟。非正向信号，以及 role 为 control 或 control 为 contraction 的信号，不发布 Δt。缺 start_s、end_s、exposure_s、n 或 nominal_period_s 时 Δt 为 null。不从 HDF5 的 end_time 字符串推断，也不把 heps_id07_eiger 用到没有逐帧起点的文件上。
+
+表中没有时间戳时的 `frames.scan_span`：
+
+```json
+{"confirmed":true,"start_s":0,"end_s":185,"exposure_s":0.3,"n":160,"nominal_period_s":1}
+```
+
+只在整段起点都缺失时填补。只要已有任一实测起点，或同时确认了 constant_period，就整段拒绝，不混用两套时间。
+
+特征信号可声明 role 为 sector 或 control，并在 clock 里给出 min_elastic_strain。只有持续的正向信号能进入 Δt。收缩是对照，不能否决。两个正向信号的起点差超过一个实测帧间隔时，各自在自己的 Δt 上与载荷做弹性窗相关；恰好一个达到 0.9 才发布，两个都达到则 conflicting_feature_events，Δt 为 null。应变通道可以带 stuck、sign_or_runaway、offset_removed、large_vs_crosshead。这些标志不把横梁位移或 eps_hkl 写进应变列。应力与力/面积不一致时 needs_input，不另算一列应力。记录外的帧保留 frame_index，应力和应变为空，不抄最后一点。
+
+```json
+{"method":"event","channel":"force","continuation_of":"parent-source","wall_start_s":1016,"parent_wall_span":{"source_id":"parent-source","local_dt_s":20.0,"uncertainty_s":1.89,"wall_start_s":1000,"preload":1}}
+```
+
+continuation_of 必须是显式字符串。子扫描只有在自己的原因属于 onset_at_first_frame、initially_changing、baseline_missing、onset_missing、event_missing、elastic_shape_weak 时才继承。子扫描的局部 Δt 等于父局部 Δt 加上墙钟起点差，不确定度再加 1 秒。文件名里的 -1 或序号不会触发。frames.archived 为 true 的扫描跳过，不读取文件。重做扫描的帧号不合并。
 
 `offset/shared` 要求确认和非空依据。锚点必须是同一物理事件两侧的观测时间，默认按实际中位帧间隔检查一致性。事件检测完整使用声明的 `baseline_samples`，不会因前两点相等自动缩短基线；MAD 为零而基线仍有波动时使用标准差后备。基线不足或已明显变化时要求补充依据。可指定 `direction: rise|fall`，结合峰位或晶格应变检查候选。事件类型采用所选通道的 `experiment`，未声明时使用顶层类型。通用事件需要 `confirmed_same_event: true`；变温波形估计始终保留为候选，该标志不取消热响应限制。确认独立依据后改用 offset/anchors 再恢复。
 
