@@ -150,7 +150,7 @@ def write_delivery(output, state, frames, table, sources, features, files, repor
                "analysis_frame_uids": [row.get("frame_uid") for row in table if row.get("valid_analysis")], "frames": manifest,
                "notes": ["Each frame remains independent; no frame combination is requested.",
                          "Raw addressing and calibration still require consumer preflight; metadata verification does not read detector pixels.",
-                         "DIDASFlow does not automatically consume this schema yet.",
+                         "DIDASFlow's handoff command consumes this file contract for supported HDF5 frames and Full 1D Q integration with an independent calibration profile.",
                          "Clock evidence, support intervals and coverage flags accompany the parameter table."]}
     for name in ("frames.csv", "peaks.csv", "decisions.json", "frame_manifest.json", "frame_records.json", "report.html"):
         state["artifacts"][name] = files.file(output / name)

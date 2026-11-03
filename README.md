@@ -15,7 +15,7 @@ flowchart LR
     G --> H[DIDASFlow 正式积分]
 ```
 
-每个原始帧保持独立。交接包引用原始数据，不复制或合并衍射帧。本版完成文件交接格式，DIDASFlow 尚未自动读取这份新格式。
+每个原始帧保持独立。交接包引用原始数据，不复制或合并衍射帧。DIDASFlow 的 `handoff` 命令可读取本格式，对支持的 HDF5 帧执行逐帧 Full 一维 Q 积分，并保留时间、外部参数及其来源。InSituLink 负责生成交接文件，正式积分由用户在 DIDASFlow 中启动。
 
 ## 安装与演示
 
@@ -55,6 +55,20 @@ py -3 -m insitulink resume --output D:/experiment/results
 报告可搜索和筛选逐帧记录，查看原始位置、曝光区间、外部参数来源及无效原因。页首分别显示对齐结果和原始数据就绪情况；日志缺口保留断线，阶梯量按保持规则绘制。帧身份与本次处理记录见 [逐帧身份与追溯](docs/FRAME_IDENTITY.md)。
 
 Agent 使用方式见 [AGENTS.md](AGENTS.md)。确定性计算在本地完成，包内没有大模型调用或网络服务。
+
+## 交给 DIDASFlow 正式积分
+
+在 DIDASFlow 的 `didasflow/` 目录中，使用实际标定建立的 DIDASFlow profile：
+
+```bash
+python run_cli.py handoff --handoff ALIGN/handoff.json --profile profile.json --output RESULTS
+```
+
+这里的 `profile.json` 是 DIDASFlow 积分配置，包含 `scan_template`、`diffraction_exp` 等输入，与 InSituLink `prepare` 生成的导入配置不同。当前入口使用内置 Full 一维 Q 工作流，支持二维或三维 HDF5 数据集中的完整二维帧；显式请求其他积分产品或自定义工作流会被拒绝。配置、迁移和恢复方法见 [DIDASFlow 交接使用说明](https://github.com/D-sudoasd/DIDASFlow/blob/main/didasflow/docs/insitulink-handoff.md)。
+
+`completed` 表示对齐完成；`ready_for_integration` 也不能替代 DIDASFlow 对原始文件、数据集、物理帧索引、来源哈希和标定的检查。交付时保留完整对齐输出、原始请求、帧时间表、外部日志和同步依据。消费者按原采集顺序处理明确选择的帧，保留全部原始记录；选中帧的参数无效或缺失时，仍保留其值、空值、标志和来源，不将它们补零或自动删除该帧。
+
+输入未变时，重复同一命令可复用已验证结果或继续未完成的任务。文件迁移使用 `--path-map map.json` 明确指定旧路径到当前路径的对应关系；来源、位置或标定发生变化后，使用新输出目录或 `--existing-output versioned` 保留此前结果。`--dry-run` 执行交接与积分预检，不产生新的谱，也不覆盖此前完成的交接结果。
 
 ## 输入、对齐与输出
 

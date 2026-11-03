@@ -203,3 +203,21 @@ files 应覆盖输入帧序列，索引重复时附加对应 `source_file`。谱
 原始身份验证结果与文件存在性分别呈现；明确无效的物理寻址不能标就绪，未能验证的格式仍需消费者预检。报告可以搜索、按有效性/设备/时间筛选并展开帧详情；无效原因同时包含帧级和必需通道级 flags。缺口断线，阶梯量按右连续规则显示。
 
 `inspect` 验证输出 SHA-256，不检查源文件；`resume` 重新检查输入与配置后复用有效阶段。只做元数据对齐时不读取图像像素。按需图像预分析追踪选中数据集的 master、嵌套外链、VDS 映射及外部存储，将实际数据文件、几何和掩膜内容加入缓存与运行期间变更检查。VDS 或外部存储存在多个搜索位置时，校验全部存在的候选及其递归依赖，并记录搜索条件，避免把某个文件系统候选误认为实际读取文件。依赖不能可靠枚举时禁止复用；重新执行仍无法验证时要求补充输入，不发布可交接结果。实际文件路径也受到输出目录保护。`truth.json` 不参与估计或恢复。
+
+## DIDASFlow 消费者
+
+DIDASFlow 可通过以下命令读取 `insitulink.handoff.v1`。命令在其仓库的 `didasflow/` 目录执行：
+
+```bash
+python run_cli.py handoff --handoff ALIGN/handoff.json --profile profile.json --output RESULTS
+```
+
+消费者的 profile 使用 DIDASFlow 的 `scan_template`、`diffraction_exp`、掩膜和校正配置，必须来自本次实验的独立标定。它与 InSituLink 的导入 profile 不同。当前交接入口仅使用内置 Full 一维 Q 工作流，处理二维或三维 HDF5 数据集中的完整二维帧；同次运行要求帧形状和数据类型一致。若显式指定 `products`，应为 `["azimuthal"]`。其他产品、自定义工作流和需额外逐帧映射的强度配方暂不支持，消费者会要求调整配置，不会自动替换。
+
+消费者先检查完成与就绪状态、正式设备时钟关系、交付文件哈希及其相互对应关系，再独立验证原始文件内容、HDF5 数据集、实际物理帧和标定输入。未确认的候选或 `null` 偏移不能变成正式零偏移。保留 `selected_frame_uids` 的采集顺序，不将 `analysis_frame_uids` 当作可以删除其他选中帧的依据。原始全部逐帧记录进入参数快照；已选择但参数覆盖不足的帧仍可按原始像素逐帧积分，其参数无效标志和缺失值同时保留。
+
+对支持的 HDF5 帧，消费者通过明确的 VDS 映射连接声明的文件、数据集和文件内索引，再调用 DIDASFlow 正式积分入口。VDS 不复制像素，不组合帧。完成后，`integration_bindings.json` 将原 `frame_uid`、采集顺序、文件/数据集/物理索引对应到实际谱文件；`frame_parameters.json` 保留原始参数、曝光区间、有效性和来源。不能将适配数据集中的连续执行序号当作原始文件内索引。
+
+交付时保留原始请求、帧时间表、日志及显式同步依据，供消费者复核来源哈希。交接目录可以整体迁移；原始输入位置变化时，通过 `--path-map map.json` 提供明确路径映射，不按文件名搜索替代。输入相同的重复执行使用既有恢复检查；来源、路径、标定或实现变化时，使用新输出目录或 `--existing-output versioned`，以保留此前结果。`--dry-run` 仅预检，并将结果与已有完成记录分开保存。
+
+`consumer_integration: "file_contract_only"` 表示 InSituLink 只发布文件、不启动 DIDASFlow；它不再表示缺少消费者。完整配置示例、支持边界和跨项目回归说明见 [DIDASFlow 交接文档](https://github.com/D-sudoasd/DIDASFlow/blob/main/didasflow/docs/insitulink-handoff.md)。

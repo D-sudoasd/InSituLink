@@ -51,4 +51,8 @@ flowchart LR
 
 `frames.csv` 适合表格处理；`frame_manifest.json` 保留身份清单；`frame_records.json` 保留逐帧追溯信息；`decisions.json` 保存设备时钟依据。`handoff.json` 引用这些产物，`status.json` 记录本次运行、输入摘要、版本和状态。
 
-`completed` 表示对齐交付完成，不能替代原始数据和标定预检。报告同时呈现原始寻址验证与 `ready_for_integration`，消费者仍需检查标定及所需文件。DIDASFlow 目前没有自动读取本格式；本项目不改动 DIDASFlow，也不执行帧合并。
+`completed` 表示对齐交付完成，不能替代原始数据和标定预检。报告同时呈现原始寻址验证与 `ready_for_integration`；DIDASFlow 的 `handoff` 消费者仍独立检查原始内容、HDF5 数据集与物理帧、来源哈希和标定配置。InSituLink 继续只发布文件，不启动消费者。
+
+当前正式积分入口支持二维或三维 HDF5 数据集中的完整二维帧，并使用内置 Full 一维 Q 工作流。消费者按交接包中的选择顺序建立 VDS 引用，每个执行位置只对应一帧，不复制像素、不重排或合并原始帧。其 `integration_bindings.json` 保留“原 `frame_uid` 与物理位置—执行位置—实际谱文件”的对应关系；`frame_parameters.json` 保留全部原始帧记录、参数来源和有效性。选中帧即使参数无效，仍保留该帧及其原始空值、标志，不填零。
+
+文件迁移需用明确的 `--path-map` 更新消费者访问位置，原始声明与 UID 仍保留。原始来源、标定或路径变化后，旧结果不能据同名文件直接复用；使用新输出目录或 `--existing-output versioned`。命令与恢复规则见 [DIDASFlow 交接使用说明](https://github.com/D-sudoasd/DIDASFlow/blob/main/didasflow/docs/insitulink-handoff.md)。
