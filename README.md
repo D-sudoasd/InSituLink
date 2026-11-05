@@ -56,6 +56,8 @@ py -3 -m insitulink resume --output D:/experiment/results
 
 Agent 使用方式见 [AGENTS.md](AGENTS.md)。确定性计算在本地完成，包内没有大模型调用或网络服务。
 
+真实数据解释案例：[HEPS G14 拉伸 TXT 列含义与踩坑记录](docs/HEPS_20261027_G14_TENSION2010_COLUMN_SEMANTICS.md)。该文件的“变形mm”存在表头与数值尺度冲突，应先核查列间关系再换算应变；此案例不构成所有 Tension2010 文件的默认单位规则。
+
 ## 交给 DIDASFlow 正式积分
 
 在 DIDASFlow 的 `didasflow/` 目录中，使用实际标定建立的 DIDASFlow profile：
@@ -113,3 +115,7 @@ py -3 -m unittest discover -s tests -v
 检查范围见 [验证说明](docs/VALIDATION.md)。目前没有真实线站数据，软件测试与合成结果不代表实际实验精度或标定正确性。
 
 MIT License。源代码：[D-sudoasd/InSituLink](https://github.com/D-sudoasd/InSituLink)。
+
+真实数据后续：[TC4五样品逐文件核查与G21面积修正](docs/HEPS_20261027_TC4_FIVE_COLUMN_AUDIT.md)。G9仅保留峰前候选，G13完整应变仍无法从现有TXT恢复；G21按现场面积修正应力，应变不变。
+
+真实数据模型：[G13参考应力–应变估计](docs/HEPS_20261027_G13_REFERENCE_STRAIN_MODEL.md)。新增模型估计应变，原应力与候选时钟保持；原失效通道不改写，峰后条件估计另标。
